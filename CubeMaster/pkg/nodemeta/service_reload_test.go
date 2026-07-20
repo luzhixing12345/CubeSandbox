@@ -209,3 +209,45 @@ func TestApplyReloadResultAddsNewNodeFromDB(t *testing.T) {
 		t.Fatalf("Labels = %v, want region=us-east", snap.Labels)
 	}
 }
+
+func TestApplyReloadResultAcceptsReregisteredNodeGeneration(t *testing.T) {
+	s := newTestService()
+	s.removedNodes.Store("node-reused", uint(41))
+
+	s.applyReloadResult(map[string]*NodeSnapshot{
+		"node-reused": {
+			NodeID:         "node-reused",
+			HostIP:         "10.0.0.42",
+			registrationID: 42,
+		},
+	})
+
+	s.mu.RLock()
+	snap, ok := s.nodes["node-reused"]
+	s.mu.RUnlock()
+	if !ok {
+		t.Fatal("a new registration generation must not be hidden by an old removal marker")
+	}
+	if snap.registrationID != 42 {
+		t.Fatalf("registrationID = %d, want 42", snap.registrationID)
+	}
+	if _, marked := s.removedNodes.Load("node-reused"); marked {
+		t.Fatal("old removal marker was not cleared")
+	}
+}
+
+func TestApplyReloadResultRejectsDeletedRegistrationGeneration(t *testing.T) {
+	s := newTestService()
+	s.removedNodes.Store("node-stale", uint(7))
+
+	s.applyReloadResult(map[string]*NodeSnapshot{
+		"node-stale": {NodeID: "node-stale", registrationID: 7},
+	})
+
+	s.mu.RLock()
+	_, ok := s.nodes["node-stale"]
+	s.mu.RUnlock()
+	if ok {
+		t.Fatal("stale reload resurrected the deleted registration generation")
+	}
+}

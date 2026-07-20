@@ -168,6 +168,25 @@ func WriteNodeMetric(ctx context.Context, m *NodeMetric) error {
 	return nil
 }
 
+// DeleteNodeMetric removes both the current and migration-era metric keys.
+// Node removal is still successful when no key exists.
+func DeleteNodeMetric(ctx context.Context, nodeID string) error {
+	if nodeID == "" {
+		return errors.New("DeleteNodeMetric: node id required")
+	}
+	keys := rediskey.ReadKeysWithFallback(rediskey.NodeMetric(nodeID), rediskey.LegacyNodeMetric(nodeID))
+	args := make(redis.Args, 0, len(keys))
+	for _, key := range keys {
+		args = args.Add(key)
+	}
+	conn := wrapredis.GetRedis()
+	if _, err := conn.Do("DEL", args...); err != nil {
+		log.G(ctx).Errorf("DeleteNodeMetric DEL failed node_id=%s: %v", nodeID, err)
+		return err
+	}
+	return nil
+}
+
 // nodeMetricTTLSec returns the configured node-metric safety TTL in seconds.
 func nodeMetricTTLSec() int {
 	if c := config.GetConfig().RedisConf; c != nil {

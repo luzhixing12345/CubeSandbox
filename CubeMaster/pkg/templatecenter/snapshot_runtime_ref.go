@@ -205,6 +205,16 @@ func upsertSnapshotRuntimeActiveTx(tx *gorm.DB, active *models.SnapshotRuntimeAc
 }
 
 func attachSnapshotRuntimeBindingTx(tx *gorm.DB, ref SnapshotRuntimeRefInfo, reason string, attachedAt time.Time, lastSeenAt *time.Time, now time.Time) error {
+	if nodeID := strings.TrimSpace(ref.NodeID); nodeID != "" {
+		// Serialize active runtime publication with node removal. The remover
+		// counts active rows while holding this same registration-row lock.
+		var registration models.NodeRegistration
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("node_id = ?", nodeID).
+			First(&registration).Error; err != nil {
+			return err
+		}
+	}
 	previous, err := findSnapshotRuntimeActiveTx(tx, ref.SandboxID, ref.BindingType)
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err

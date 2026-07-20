@@ -128,6 +128,12 @@ func (c *Client) GetNode(ctx context.Context, nodeID string) (json.RawMessage, e
 	return c.get(ctx, fmt.Sprintf("/internal/meta/nodes/%s", escaped))
 }
 
+// DeleteNode removes an isolated, drained node from CubeMaster.
+func (c *Client) DeleteNode(ctx context.Context, nodeID string) (json.RawMessage, error) {
+	escaped := url.PathEscape(nodeID)
+	return c.delete(ctx, fmt.Sprintf("/internal/meta/nodes/%s", escaped))
+}
+
 // ListSandboxes fetches the sandbox list from CubeMaster.
 func (c *Client) ListSandboxes(ctx context.Context) (json.RawMessage, error) {
 	return c.post(ctx, "/cube/sandbox/list", map[string]interface{}{

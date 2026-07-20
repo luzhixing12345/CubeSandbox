@@ -33,6 +33,7 @@ import (
 	sandboxtypes "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/task"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -1125,22 +1126,33 @@ func UpsertReplica(ctx context.Context, templateID, instanceType string, replica
 	if !isReady() {
 		return ErrTemplateStoreNotInitialized
 	}
-	record := &models.TemplateReplica{}
-	// Do not reuse the *gorm.DB chain after First on PostgreSQL: GORM may emit
-	// UPDATE ... FROM t_cube_template_replica (SQLSTATE 42712).
-	err := store.db.WithContext(ctx).Table(constants.TemplateReplicaTableName).
-		Where("template_id = ? AND node_id = ?", templateID, replica.NodeID).
-		First(record).Error
-	if err != nil {
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
+	return store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Serialize placement publication with node removal. If removal wins
+		// the row lock and deletes registration, this write is rejected.
+		var registration models.NodeRegistration
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("node_id = ?", replica.NodeID).
+			First(&registration).Error; err != nil {
 			return err
 		}
-		return store.db.WithContext(ctx).Table(constants.TemplateReplicaTableName).
-			Create(replicaStatusToModel(templateID, instanceType, replica)).Error
-	}
-	return store.db.WithContext(ctx).Table(constants.TemplateReplicaTableName).
-		Where("template_id = ? AND node_id = ?", templateID, replica.NodeID).
-		Updates(replicaStatusUpdateFields(instanceType, replica)).Error
+
+		record := &models.TemplateReplica{}
+		// Do not reuse the *gorm.DB chain after First on PostgreSQL: GORM may
+		// emit UPDATE ... FROM t_cube_template_replica (SQLSTATE 42712).
+		err := tx.Table(constants.TemplateReplicaTableName).
+			Where("template_id = ? AND node_id = ?", templateID, replica.NodeID).
+			First(record).Error
+		if err != nil {
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			return tx.Table(constants.TemplateReplicaTableName).
+				Create(replicaStatusToModel(templateID, instanceType, replica)).Error
+		}
+		return tx.Table(constants.TemplateReplicaTableName).
+			Where("template_id = ? AND node_id = ?", templateID, replica.NodeID).
+			Updates(replicaStatusUpdateFields(instanceType, replica)).Error
+	})
 }
 
 func EnsureReadyReplica(ctx context.Context, templateID string) error {

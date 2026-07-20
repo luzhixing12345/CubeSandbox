@@ -6,10 +6,12 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tencentcloud/CubeSandbox/CubeOps/internal/cubemaster"
 	"github.com/tencentcloud/CubeSandbox/CubeOps/internal/httputil"
 )
 
@@ -27,6 +29,7 @@ func (h *ClusterHandler) Register(r *gin.RouterGroup) {
 	r.GET("/cluster/versions", h.Versions)
 	r.GET("/nodes", h.ListNodes)
 	r.GET("/nodes/:nodeID", h.GetNode)
+	r.DELETE("/nodes/:nodeID", h.DeleteNode)
 }
 
 // --- Response types matching the frontend's expected format ---
@@ -251,6 +254,28 @@ func (h *ClusterHandler) GetNode(c *gin.Context) {
 	}
 	used := h.fetchUsedResources(c.Request.Context())
 	httputil.WriteJSON(c, http.StatusOK, toNodeView(*resp.Data, used))
+}
+
+// DeleteNode handles DELETE /nodes/{nodeID}.
+func (h *ClusterHandler) DeleteNode(c *gin.Context) {
+	nodeID := c.Param("nodeID")
+	if nodeID == "" {
+		httputil.WriteError(c, http.StatusBadRequest, "nodeID is required")
+		return
+	}
+	if _, err := h.cm.DeleteNode(c.Request.Context(), nodeID); err != nil {
+		var cmErr *cubemaster.CMError
+		switch {
+		case errors.As(err, &cmErr) && cmErr.IsNotFound():
+			httputil.WriteError(c, http.StatusNotFound, cmErr.RetMsg)
+		case errors.As(err, &cmErr) && cmErr.IsConflict():
+			httputil.WriteError(c, http.StatusConflict, cmErr.RetMsg)
+		default:
+			httputil.WriteError(c, http.StatusBadGateway, "failed to remove node: "+err.Error())
+		}
+		return
+	}
+	httputil.WriteNoContent(c)
 }
 
 // Versions handles GET /cluster/versions.

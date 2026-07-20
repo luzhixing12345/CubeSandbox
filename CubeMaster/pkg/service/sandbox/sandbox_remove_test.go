@@ -12,6 +12,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/ret"
 	basetypes "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/types"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
@@ -109,4 +110,24 @@ func TestSetSyncDestroyFailureKeepsTypedConnectionFailureInternal(t *testing.T) 
 
 	assert.Equal(t, int(errorcode.ErrorCode_MasterInternalError), rsp.Ret.RetCode)
 	assert.Equal(t, "cubelet connection reset", rsp.Ret.RetMsg)
+}
+
+func TestCallCubeletUnreachableNodePreservesSandboxMetadata(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	metadataDeleted := false
+	patches.ApplyFunc(cubelet.Destroy, func(context.Context, string, *cubebox.DestroyCubeSandboxRequest) (*cubebox.DestroyCubeSandboxResponse, error) {
+		return nil, errors.New("cubelet unreachable")
+	})
+	patches.ApplyFunc(localcache.DeleteSandboxProxyMap, func(context.Context, string) error {
+		metadataDeleted = true
+		return nil
+	})
+
+	err := callCubelet(context.Background(), "10.0.0.9:9999", &cubebox.DestroyCubeSandboxRequest{
+		SandboxID: "sandbox-orphan-risk",
+	})
+	assert.Error(t, err)
+	assert.False(t, metadataDeleted, "metadata must remain available for orphan reconciliation")
 }

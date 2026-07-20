@@ -215,6 +215,24 @@ func UpsertNode(n *node.Node) {
 	}
 }
 
+// RemoveNode evicts a node from every in-process scheduling index and closes
+// its cached Cubelet connection. Callers must drain the node before invoking
+// this function.
+func RemoveNode(nodeID string) {
+	if nodeID == "" {
+		return
+	}
+	SyncNodeTemplates(nodeID, nil)
+	cached, ok := GetNode(nodeID)
+	if !ok {
+		cached = &node.Node{InsID: nodeID}
+	}
+	l.delNodeCache(cached)
+	if l.templateNodeCache != nil {
+		l.templateNodeCache.Delete(nodeID)
+	}
+}
+
 func NotifyEvent(e *Event) error {
 	select {
 	case l.event <- e:

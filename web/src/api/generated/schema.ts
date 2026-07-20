@@ -79,7 +79,7 @@ export interface paths {
         get: operations["get_node"];
         put?: never;
         post?: never;
-        delete?: never;
+        delete: operations["delete_node"];
         options?: never;
         head?: never;
         patch?: never;
@@ -309,8 +309,12 @@ export interface components {
             cpuCount: string;
             /** Format: int32 */
             diskSizeMB?: number | null;
-            /** Format: date-time */
-            endAt: string;
+            /**
+             * Format: date-time
+             * @description Projected next-timeout instant. Omitted for never-timeout sandboxes
+             *     (no deadline) rather than being misreported as equal to startedAt.
+             */
+            endAt?: string | null;
             envdVersion: string;
             /** Format: int32 */
             memoryMB: number;
@@ -396,8 +400,11 @@ export interface components {
         /** @description Request body for POST /sandboxes/{id}/resume (deprecated). */
         ResumedSandbox: {
             autoPause?: boolean;
-            /** Format: int32 */
-            timeout?: number;
+            /**
+             * Format: int32
+             * @description Idle timeout in seconds; None when the client did not send one.
+             */
+            timeout?: number | null;
         };
         /**
          * @description Response for POST /sandboxes and POST /sandboxes/{id}/connect.
@@ -422,8 +429,12 @@ export interface components {
             /** Format: int32 */
             diskSizeMB?: number | null;
             domain?: string | null;
-            /** Format: date-time */
-            endAt: string;
+            /**
+             * Format: date-time
+             * @description Projected next-timeout instant. Omitted for never-timeout sandboxes
+             *     (no deadline) rather than being misreported as equal to startedAt.
+             */
+            endAt?: string | null;
             envdAccessToken?: string | null;
             envdVersion: string;
             /** Format: int32 */
@@ -491,9 +502,9 @@ export interface components {
             /** @description Whether public internet access is allowed for sandboxes from this template. */
             allowInternetAccess?: boolean | null;
             createRequest?: unknown;
+            instanceType?: string | null;
             /** @description Latest create/rebuild job id for the template. */
             jobID?: string | null;
-            instanceType?: string | null;
             lastError?: string | null;
             /** @description Network type used when the template was created, e.g. "tap". */
             networkType?: string | null;
@@ -518,12 +529,12 @@ export interface components {
             createdAt?: string | null;
             imageInfo?: string | null;
             instanceType?: string | null;
+            /** @description Latest create/rebuild job id for the template. */
+            jobID?: string | null;
             lastError?: string | null;
             status: string;
             templateID: string;
             version?: string | null;
-            /** @description Latest create/rebuild job id for the template. */
-            jobID?: string | null;
         };
         /** @description Full node x component version matrix. */
         VersionMatrixView: {
@@ -706,6 +717,63 @@ export interface operations {
             };
         };
     };
+    delete_node: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Node identifier */
+                nodeID: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Node removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid node identifier */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Node not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Removal blocked: node is not isolated/reachable, sandbox creation is in progress, or sandbox specs, active runtime refs, template replicas, or artifact placements remain */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Unexpected backend error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
     get_sandbox: {
         parameters: {
             query?: never;
@@ -775,9 +843,36 @@ export interface operations {
                     "application/json": components["schemas"]["ApiError"];
                 };
             };
+            /** @description The existing standard API request timeout expired before the synchronous delete completed */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Paused sandbox cannot be admitted for internal resume because node capacity or resource metadata is unavailable */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
             /** @description Unexpected backend error */
             500: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Sandbox is pausing, another lifecycle operation is in progress, the Cubelet RPC has too little remaining time, or its internal resume could not be completed */
+            503: {
+                headers: {
+                    /** @description Seconds a client should wait before retrying DELETE */
+                    "Retry-After"?: number;
                     [name: string]: unknown;
                 };
                 content: {

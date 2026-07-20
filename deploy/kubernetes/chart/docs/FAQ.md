@@ -133,7 +133,7 @@ kubectl -n cube-system describe pod <pod-name>
 
 ### B4. 想临时把 compute 节点摘出去维护
 
-**推荐做法**:先把 Cubelet 上的 sandbox pause 或迁移,再执行:
+**推荐做法**:临时维护时先把 Cubelet 上的 sandbox pause 或迁移,再执行:
 
 ```bash
 kubectl drain <node> --ignore-daemonsets --delete-emptydir-data=false
@@ -142,6 +142,8 @@ kubectl uncordon <node>
 ```
 
 `cube-node` DaemonSet 会在节点重新加入后自动重启并注册到 CubeMaster。
+
+`kubectl drain` 适用于临时维护，不会删除 CubeMaster 中的节点记录。永久退役节点时，还需先通过 `cubemastercli node isolate <node-id>` 隔离并清空 sandbox、active snapshot runtime reference、template replica 和 artifact placement，在 Cubelet 仍可访问时执行 `cubemastercli node remove --yes <node-id>`。不要把心跳超时当作节点删除。
 
 ---
 

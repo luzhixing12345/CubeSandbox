@@ -32,6 +32,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/sandboxspec"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/affinity"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/scheduler/selctx"
@@ -77,6 +78,8 @@ type createSandboxContext struct {
 	// paths and we only emit a trace when the corresponding op ran.
 	redisCost time.Duration
 	specCost  time.Duration
+
+	nodeCreateLeaseID string
 }
 
 type createOriginRequestKey struct{}
@@ -181,10 +184,11 @@ func (c *createSandboxContext) Wait() {
 func (c *createSandboxContext) Handle() {
 	c.startHandleTime = time.Now()
 	defer func() {
+		c.releaseNodeCreateLease()
 		if r := recover(); r != nil {
 			log.G(c.ctx).Fatalf("Handle panic:%+v", string(debug.Stack()))
 			c.setMasterRsp(int(errorcode.ErrorCode_ReqCubeAPIFailed), "panic fatal error")
-		} else {
+		} else if !c.hasSetRet {
 			c.setMasterRsp(int(c.cubeletRsp.GetRet().GetRetCode()), c.cubeletRsp.GetRet().GetRetMsg())
 		}
 
@@ -229,7 +233,17 @@ func (c *createSandboxContext) handleCubelet() {
 			continue
 		}
 
+		leaseID, err := sandboxspec.AcquireNodeCreateLease(
+			c.ctx, c.selectHost.ID(), c.selectHost.HostIP())
+		if err != nil {
+			c.setMasterRsp(int(errorcode.ErrorCode_DBError),
+				fmt.Sprintf("acquire node create lease failed: %s", err))
+			return
+		}
+		c.nodeCreateLeaseID = leaseID
+
 		if c.callCubelet() {
+			c.releaseNodeCreateLease()
 			c.retryCost += c.cubeletEndTime.Sub(c.cubeletStartTime)
 			c.retryTimes++
 
@@ -241,8 +255,20 @@ func (c *createSandboxContext) handleCubelet() {
 		}
 
 		c.dealSuccResult()
+		c.releaseNodeCreateLease()
 		return
 	}
+}
+
+func (c *createSandboxContext) releaseNodeCreateLease() {
+	if c.nodeCreateLeaseID == "" {
+		return
+	}
+	if err := sandboxspec.ReleaseNodeCreateLease(context.Background(), c.nodeCreateLeaseID); err != nil {
+		log.G(c.ctx).Warnf("release node create lease failed lease=%s err=%v", c.nodeCreateLeaseID, err)
+		return
+	}
+	c.nodeCreateLeaseID = ""
 }
 
 func (c *createSandboxContext) refreshAndAdmitHost() error {
@@ -322,17 +348,12 @@ func (c *createSandboxContext) dealSuccResult() {
 				log.G(c.ctx).Warnf("no port mapping in response")
 			}
 		}
-		// Run the post-create writes (proxy redis HSET + sandbox_spec
-		// MySQL UPSERT) in parallel since they have no data dependency.
-		// The wall-clock cost collapses to max(redis, spec) instead of
-		// sum, while preserving the original fail-fast semantics:
-		//   - Redis failure still flips the master response to DBError
-		//     so the caller observes a failed create.
-		//   - Spec failure is still warn-only (persistSandboxSpec logs
-		//     the error internally and returns nothing); it never
-		//     short-circuits the create reply.
+		// Run the post-create writes in parallel. Both are authoritative for
+		// lifecycle safety: a missing sandbox_spec would allow node removal to
+		// overlook a live sandbox, so either failure fails create and lets the
+		// existing failover path destroy the just-created sandbox.
 		g := new(errgroup.Group)
-		var redisErr error
+		var redisErr, specErr error
 		g.Go(func() error {
 			redisStart := time.Now()
 			redisErr = c.setProxyToRedis()
@@ -341,13 +362,18 @@ func (c *createSandboxContext) dealSuccResult() {
 		})
 		g.Go(func() error {
 			specStart := time.Now()
-			c.persistSandboxSpec()
+			specErr = c.persistSandboxSpec()
 			c.specCost = time.Since(specStart)
-			return nil
+			return specErr
 		})
 		_ = g.Wait()
 		if redisErr != nil {
 			c.setMasterRsp(int(errorcode.ErrorCode_DBError), fmt.Sprintf("setProxyToRedis fail:%s", redisErr))
+			return
+		}
+		if specErr != nil {
+			c.setMasterRsp(int(errorcode.ErrorCode_DBError), fmt.Sprintf("persist sandbox spec fail:%s", specErr))
+			return
 		}
 
 		c.setMasterRsp(int(c.cubeletRsp.GetRet().GetRetCode()), c.cubeletRsp.GetRet().GetRetMsg())
@@ -356,20 +382,22 @@ func (c *createSandboxContext) dealSuccResult() {
 
 // persistSandboxSpec hands the original create request to the registered
 // post-create hook (wired by templatecenter to sandboxspec.Put). Hook
-// failures are logged but never bubble up: spec persistence is best-effort
-// and any later flow that needs the spec falls back to base template lookup.
-func (c *createSandboxContext) persistSandboxSpec() {
+// failures bubble up so the create failover path can destroy the sandbox and
+// avoid an untracked workload that would bypass node-removal checks.
+func (c *createSandboxContext) persistSandboxSpec() error {
 	originReq := createOriginRequestFromContext(c.ctx)
 	if originReq == nil || c.masterRsp == nil {
-		return
+		return errors.New("sandbox create request is unavailable")
 	}
 	sandboxID := c.masterRsp.SandboxID
 	if sandboxID == "" || c.selectHost == nil {
-		return
+		return errors.New("sandbox placement result is incomplete")
 	}
 	if err := runAfterCreateSandboxSuccessHook(c.ctx, sandboxID, c.selectHost.ID(), c.selectHost.HostIP(), originReq); err != nil {
 		log.G(c.ctx).Warnf("persist sandbox spec failed sandbox=%s: %v", sandboxID, err)
+		return err
 	}
+	return nil
 }
 
 func (c *createSandboxContext) failover() {

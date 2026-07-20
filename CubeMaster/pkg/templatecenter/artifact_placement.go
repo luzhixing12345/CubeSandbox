@@ -31,11 +31,19 @@ func upsertArtifactNodePlacement(ctx context.Context, artifactID, nodeID, nodeIP
 		NodeIP:     strings.TrimSpace(nodeIP),
 		CreatedAt:  time.Now().Unix(),
 	}
-	return store.db.WithContext(ctx).Table(constants.ArtifactNodePlacementTableName).
-		Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "artifact_id"}, {Name: "node_id"}},
-			DoUpdates: clause.AssignmentColumns([]string{"node_ip"}),
-		}).Create(row).Error
+	return store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var registration models.NodeRegistration
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("node_id = ?", nodeID).
+			First(&registration).Error; err != nil {
+			return err
+		}
+		return tx.Table(constants.ArtifactNodePlacementTableName).
+			Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "artifact_id"}, {Name: "node_id"}},
+				DoUpdates: clause.AssignmentColumns([]string{"node_ip"}),
+			}).Create(row).Error
+	})
 }
 
 // listArtifactNodePlacementsTx enumerates every node that holds (or held)

@@ -7,7 +7,6 @@ package sandbox
 import (
 	"context"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
@@ -178,32 +177,27 @@ func dealScfSandbox(ctx context.Context, req *types.DeleteCubeSandboxReq, t *tas
 }
 
 func callCubelet(ctx context.Context, callEp string, req *cubebox.DestroyCubeSandboxRequest) error {
-	hostIP := strings.Split(callEp, ":")[0]
-	_, ok := localcache.GetNodesByIp(hostIP)
-	if ok {
-
-		rsp, err := cubelet.Destroy(ctx, callEp, req)
-		defer func() {
-			if log.IsDebug() {
-				log.G(ctx).Debugf("Destroy_rsp:%+v", utils.InterfaceToString(rsp))
-			}
-		}()
-
-		if err != nil {
-			log.G(ctx).Errorf("Destroy fail:%+v", err)
-			return err
+	rsp, err := cubelet.Destroy(ctx, callEp, req)
+	defer func() {
+		if log.IsDebug() {
+			log.G(ctx).Debugf("Destroy_rsp:%+v", utils.InterfaceToString(rsp))
 		}
-		if rsp.GetRet().GetRetCode() != cubeleterrorcode.ErrorCode_Success &&
-			rsp.GetRet().GetRetCode() != cubeleterrorcode.ErrorCode_OK {
-			log.G(ctx).Errorf("Destroy error:%+v", rsp)
-			return ret.Err(errorcode.MasterCode(rsp.GetRet().GetRetCode()), rsp.GetRet().GetRetMsg())
-		}
-		// Apply any node-level volume ref-count transitions (1→0) reported by
-		// Cubelet so the volume DB releases the reference held by this node.
-		volrefcount.ApplyFromExtInfo(ctx, rsp.GetExtInfo())
+	}()
+
+	if err != nil {
+		log.G(ctx).Errorf("Destroy fail:%+v", err)
+		return err
 	}
+	if rsp.GetRet().GetRetCode() != cubeleterrorcode.ErrorCode_Success &&
+		rsp.GetRet().GetRetCode() != cubeleterrorcode.ErrorCode_OK {
+		log.G(ctx).Errorf("Destroy error:%+v", rsp)
+		return ret.Err(errorcode.MasterCode(rsp.GetRet().GetRetCode()), rsp.GetRet().GetRetMsg())
+	}
+	// Apply any node-level volume ref-count transitions (1→0) reported by
+	// Cubelet so the volume DB releases the reference held by this node.
+	volrefcount.ApplyFromExtInfo(ctx, rsp.GetExtInfo())
 
-	err := localcache.DeleteSandboxProxyMap(ctx, req.GetSandboxID())
+	err = localcache.DeleteSandboxProxyMap(ctx, req.GetSandboxID())
 	if err != nil {
 		log.G(ctx).Errorf("DeleteSandboxProxyMap:%+v", err)
 		return ret.Errorf(errorcode.ErrorCode_MasterInternalError, "DeleteSandboxProxyMap failed: %s", err.Error())

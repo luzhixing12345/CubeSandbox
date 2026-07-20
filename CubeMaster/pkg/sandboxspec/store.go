@@ -16,11 +16,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/google/uuid"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db/models"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
 	sandboxtypes "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -32,6 +37,8 @@ var (
 	// ErrSandboxSpecStoreNotReady is returned when Init has not been called.
 	ErrSandboxSpecStoreNotReady = errors.New("sandbox spec store is not initialized")
 )
+
+const nodeCreateLeasePrefix = "__node_create_lease__:"
 
 var (
 	dbMu sync.RWMutex
@@ -58,6 +65,79 @@ func getDB() *gorm.DB {
 	return db
 }
 
+// AcquireNodeCreateLease publishes a cross-replica marker before Cubelet
+// create starts. Node removal counts this marker as a sandbox dependency.
+func AcquireNodeCreateLease(ctx context.Context, nodeID, nodeIP string) (string, error) {
+	client := getDB()
+	if client == nil {
+		return "", ErrSandboxSpecStoreNotReady
+	}
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return "", errors.New("node_id is required")
+	}
+	leaseID := nodeCreateLeasePrefix + uuid.NewString()
+	err := client.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var registration models.NodeRegistration
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("node_id = ?", nodeID).
+			First(&registration).Error; err != nil {
+			return err
+		}
+		var labels map[string]string
+		if err := json.Unmarshal([]byte(registration.LabelsJSON), &labels); err != nil {
+			return fmt.Errorf("decode node labels: %w", err)
+		}
+		if node.DecodeSchedulingDisabled(labels) {
+			return errors.New("node is scheduling-disabled")
+		}
+		return tx.Create(&models.SandboxSpec{
+			SandboxID:   leaseID,
+			HostID:      nodeID,
+			HostIP:      strings.TrimSpace(nodeIP),
+			RequestJSON: "{}",
+			Backfilled:  true,
+		}).Error
+	})
+	if err != nil {
+		return "", err
+	}
+	return leaseID, nil
+}
+
+func ReleaseNodeCreateLease(ctx context.Context, leaseID string) error {
+	leaseID = strings.TrimSpace(leaseID)
+	if !strings.HasPrefix(leaseID, nodeCreateLeasePrefix) {
+		return nil
+	}
+	client := getDB()
+	if client == nil {
+		return ErrSandboxSpecStoreNotReady
+	}
+	return client.WithContext(ctx).Unscoped().
+		Where("sandbox_id = ?", leaseID).
+		Delete(&models.SandboxSpec{}).Error
+}
+
+// PruneExpiredNodeCreateLeasesTx removes crash-left markers while node removal
+// holds the registration-row lock.
+func PruneExpiredNodeCreateLeasesTx(tx *gorm.DB, nodeID string, now time.Time) error {
+	return tx.Unscoped().
+		Where("host_id = ? AND sandbox_id LIKE ? AND created_at < ?",
+			nodeID, nodeCreateLeasePrefix+"%", now.Add(-nodeCreateLeaseTTL())).
+		Delete(&models.SandboxSpec{}).Error
+}
+
+func nodeCreateLeaseTTL() time.Duration {
+	timeout := time.Duration(config.GetConfig().CubeletConf.CreateTimeoutInsec) * time.Second
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	// The create context is bounded by create_timeout_insec. Keep an extra
+	// grace period for post-create persistence and failover cleanup.
+	return timeout + 10*time.Minute
+}
+
 // IsReady reports whether the store has a usable db handle.
 func IsReady() bool {
 	return getDB() != nil
@@ -76,9 +156,8 @@ type PutOptions struct {
 // is canonicalized before storage to remove transient fields (Timeout, InsId,
 // nested Request envelope) so the stored value is deterministic.
 //
-// The original sandbox creation flow MUST NOT fail if Put fails - callers
-// should log and proceed, as the spec store is recovery-friendly: a missing
-// record is later detected and backfilled best-effort.
+// The sandbox creation flow treats Put failure as fatal and destroys the
+// just-created workload, because node removal relies on this record.
 func Put(ctx context.Context, sandboxID string, req *sandboxtypes.CreateCubeSandboxReq, opts PutOptions) error {
 	err := doPut(ctx, sandboxID, req, opts)
 	if err != nil {
@@ -125,21 +204,34 @@ func doPut(ctx context.Context, sandboxID string, req *sandboxtypes.CreateCubeSa
 	//   - id is preserved on conflict (UNIQUE-key-only conflict path),
 	//   - created_at is preserved on conflict (only set on first insert),
 	//   - updated_at is automatically refreshed by gorm via UpdateTime hook.
-	return client.WithContext(ctx).Table(constants.SandboxSpecTableName).
-		Clauses(clause.OnConflict{
-			Columns: []clause.Column{{Name: "sandbox_id"}},
-			DoUpdates: clause.AssignmentColumns([]string{
-				"template_id",
-				"instance_type",
-				"network_type",
-				"host_id",
-				"host_ip",
-				"request_json",
-				"backfilled",
-				"updated_at",
-			}),
-		}).
-		Create(rec).Error
+	return client.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if rec.HostID != "" {
+			// Serialize sandbox publication with node removal. This closes the
+			// interval between Cubelet create success and the dependency count
+			// in the node-removal transaction.
+			var registration models.NodeRegistration
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("node_id = ?", rec.HostID).
+				First(&registration).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Table(constants.SandboxSpecTableName).
+			Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "sandbox_id"}},
+				DoUpdates: clause.AssignmentColumns([]string{
+					"template_id",
+					"instance_type",
+					"network_type",
+					"host_id",
+					"host_ip",
+					"request_json",
+					"backfilled",
+					"updated_at",
+				}),
+			}).
+			Create(rec).Error
+	})
 }
 
 // persistFailureReason classifies a Put error into a low-cardinality metric

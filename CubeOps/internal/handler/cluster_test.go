@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tencentcloud/CubeSandbox/CubeOps/internal/cubemaster"
 )
 
 func newClusterRouter(t *testing.T, cm CubeMasterClient) *gin.Engine {
@@ -182,5 +183,32 @@ func TestCluster_Versions_CMError_ReturnsEmptyShell(t *testing.T) {
 	// Should return an empty structure, not an error, so the UI doesn't break.
 	if _, ok := resp["controlPlane"]; !ok {
 		t.Errorf("expected controlPlane key in empty shell, got %v", resp)
+	}
+}
+
+func TestCluster_DeleteNode(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{name: "success", wantStatus: http.StatusNoContent},
+		{name: "not found", err: &cubemaster.CMError{RetCode: 130404, RetMsg: "node not found"}, wantStatus: http.StatusNotFound},
+		{name: "conflict", err: &cubemaster.CMError{RetCode: 130409, RetMsg: "node still has sandboxes"}, wantStatus: http.StatusConflict},
+		{name: "backend failure", err: errFakeNotConfigured, wantStatus: http.StatusBadGateway},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cm := &fakeCM{deleteNode: func(_ context.Context, nodeID string) (json.RawMessage, error) {
+				if nodeID != "node-1" {
+					t.Fatalf("nodeID = %q, want node-1", nodeID)
+				}
+				return raw(`{"ret":{"ret_code":200}}`), tt.err
+			}}
+			w := httptestRecorder(t, newClusterRouter(t, cm), http.MethodDelete, "/api/v1/nodes/node-1")
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, tt.wantStatus, w.Body.String())
+			}
+		})
 	}
 }

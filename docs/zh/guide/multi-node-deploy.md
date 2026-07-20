@@ -159,6 +159,24 @@ sudo ./down.sh
 
 计算节点模式下，该命令只会停止 `cubelet` 和 `network-agent`，不影响控制面或其他计算节点。
 
+### 永久移除计算节点
+
+停止服务不会从 CubeMaster 删除节点。安全退役节点应按以下顺序操作：
+
+1. 禁止继续向该节点调度沙箱：
+   ```bash
+   cubemastercli node isolate <node-id>
+   ```
+2. 迁移或销毁节点上的全部沙箱；仅暂停沙箱并不等于排空。同时完成该节点关联的模板和 artifact 清理。
+3. 在 Cubelet 仍可访问时删除已经排空的节点：
+   ```bash
+   cubemastercli node remove --yes <node-id>
+   ```
+   CubeMaster 会在提交删除前确认 Cubelet 的实时 inventory 为空。
+4. 停止计算节点服务，使其不再尝试发送心跳。
+
+只有节点已隔离，且不再存在 sandbox spec、活动 snapshot runtime ref、template replica 或 artifact placement 时，删除操作才会成功。心跳超时只会将节点标记为不健康，不等同于删除。后续重新安装时，相同 node ID 会作为新活动节点重新注册。
+
 ### 重新安装
 
 直接再次运行 `install-compute.sh` 即可。安装脚本会自动停止已有部署再进行安装。

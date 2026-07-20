@@ -147,6 +147,16 @@ func getNodeGinHandler(c *gin.Context) {
 	})
 }
 
+// deleteNodeGinHandler decommissions an isolated, fully drained node.
+func deleteNodeGinHandler(c *gin.Context) {
+	data, err := nodemeta.DeleteNode(c.Request.Context(), c.Param("node_id"))
+	if err != nil {
+		writeErr(c.Writer, http.StatusOK, err)
+		return
+	}
+	common.WriteAPI(c, &nodeResponse{Ret: successRet(), Data: data})
+}
+
 func listNodesGinHandler(c *gin.Context) {
 	data, err := nodemeta.ListNodes(c.Request.Context())
 	if err != nil {
@@ -232,6 +242,11 @@ func writeErr(w http.ResponseWriter, status int, err error) {
 		retCode = int(errorcode.ErrorCode_NotFound)
 	case errors.Is(err, nodemeta.ErrLabelsJSONCorrupt), errors.Is(err, nodemeta.ErrSchedulingLabelRejected):
 		retCode = int(errorcode.ErrorCode_MasterParamsError)
+	case errors.Is(err, nodemeta.ErrNodeNotIsolated),
+		errors.Is(err, nodemeta.ErrNodeRemovalBusy),
+		errors.Is(err, nodemeta.ErrNodeInventoryUnavailable),
+		errors.Is(err, nodemeta.ErrNodeIdentityChanged):
+		retCode = int(errorcode.ErrorCode_Conflict)
 	}
 	common.WriteResponse(w, status, &sandboxtypes.Res{
 		Ret: &sandboxtypes.Ret{

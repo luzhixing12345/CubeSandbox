@@ -74,6 +74,39 @@ func TestGetNodeExtractsNodeIDFromPath(t *testing.T) {
 	assert.Equal(t, int(errorcode.ErrorCode_Success), decodeRetCode(t, w.Body.Bytes()))
 }
 
+func TestDeleteNodeExtractsNodeIDFromPath(t *testing.T) {
+	var gotNodeID string
+	patch := gomonkey.ApplyFunc(nodemeta.DeleteNode,
+		func(_ context.Context, nodeID string) (*nodemeta.NodeSnapshot, error) {
+			gotNodeID = nodeID
+			return &nodemeta.NodeSnapshot{NodeID: nodeID}, nil
+		})
+	defer patch.Reset()
+
+	r := newMetaEngine()
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, MetaURI()+"/nodes/node-42", nil))
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "node-42", gotNodeID)
+	assert.Equal(t, int(errorcode.ErrorCode_Success), decodeRetCode(t, w.Body.Bytes()))
+}
+
+func TestDeleteNodeConflictMapping(t *testing.T) {
+	patch := gomonkey.ApplyFunc(nodemeta.DeleteNode,
+		func(_ context.Context, _ string) (*nodemeta.NodeSnapshot, error) {
+			return nil, nodemeta.ErrNodeNotIsolated
+		})
+	defer patch.Reset()
+
+	r := newMetaEngine()
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, MetaURI()+"/nodes/node-42", nil))
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, int(errorcode.ErrorCode_Conflict), decodeRetCode(t, w.Body.Bytes()))
+}
+
 // TestDeleteNodeLabelExtractsNodeIDAndKeyQuery proves both extraction axes:
 // node_id from the path AND key from c.Query("key").
 func TestDeleteNodeLabelExtractsNodeIDAndKeyQuery(t *testing.T) {

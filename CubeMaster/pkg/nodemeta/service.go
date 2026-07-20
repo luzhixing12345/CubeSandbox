@@ -148,6 +148,10 @@ type NodeSnapshot struct {
 	// labelsJSONCorrupt marks that labels_json failed to parse; scheduling is
 	// fail-closed. Not serialised.
 	labelsJSONCorrupt bool
+	// registrationID identifies the concrete database registration generation.
+	// It lets reload distinguish a stale pre-delete snapshot from a later
+	// registration which legitimately reuses the same node ID.
+	registrationID uint
 }
 
 type service struct {
@@ -171,6 +175,16 @@ type service struct {
 	// admin labels, isolation) per node so DB commit and in-memory/localcache
 	// publication stay ordered.
 	labelWriteLocks sync.Map
+
+	// lifecycleLocks serialises register, heartbeat, and removal operations for
+	// a node within this process. Database row locks provide the equivalent
+	// ordering across CubeMaster replicas.
+	lifecycleLocks sync.Map
+
+	// removedNodes maps node ID to the database registration generation removed
+	// by DELETE. Reload only suppresses that exact generation; a later
+	// registration may legitimately reuse the same node ID on another replica.
+	removedNodes sync.Map
 }
 
 var global = &service{
@@ -211,6 +225,9 @@ func RegisterNode(ctx context.Context, req *RegisterNodeRequest) (*NodeSnapshot,
 	if req == nil || req.NodeID == "" {
 		return nil, fmt.Errorf("node_id is required")
 	}
+	unlockLifecycle := global.lockNodeLifecycle(req.NodeID)
+	defer unlockLifecycle()
+	global.removedNodes.Delete(req.NodeID)
 	if req.HostIP == "" {
 		req.HostIP = req.NodeID
 	}
@@ -272,6 +289,7 @@ func RegisterNode(ctx context.Context, req *RegisterNodeRequest) (*NodeSnapshot,
 	snap := global.ensureNode(req.NodeID)
 	global.mu.Lock()
 	snap.NodeID = req.NodeID
+	snap.registrationID = reg.ID
 	snap.HostIP = req.HostIP
 	snap.GRPCPort = req.GRPCPort
 	snap.Labels = cloneStringMap(mergedLabels)
@@ -295,6 +313,8 @@ func UpdateNodeStatus(ctx context.Context, nodeID string, req *UpdateNodeStatusR
 	if nodeID == "" {
 		return nil, fmt.Errorf("node_id is required")
 	}
+	unlockLifecycle := global.lockNodeLifecycle(nodeID)
+	defer unlockLifecycle()
 	if req == nil {
 		req = &UpdateNodeStatusRequest{}
 	}
@@ -310,13 +330,23 @@ func UpdateNodeStatus(ctx context.Context, nodeID string, req *UpdateNodeStatusR
 		HeartbeatUnix:      req.HeartbeatTime.Unix(),
 		Healthy:            reportedReady,
 	}
-	if err := global.db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "node_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{
-			"conditions_json", "images_json", "local_templates_json",
-			"heartbeat_unix", "healthy", "updated_at",
-		}),
-	}).Create(status).Error; err != nil {
+	if err := global.db.Transaction(func(tx *gorm.DB) error {
+		// Lock the registration row so a concurrent removal on another
+		// CubeMaster replica cannot leave an orphan status row behind.
+		var registration models.NodeRegistration
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("node_id = ?", nodeID).
+			First(&registration).Error; err != nil {
+			return err
+		}
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "node_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"conditions_json", "images_json", "local_templates_json",
+				"heartbeat_unix", "healthy", "updated_at",
+			}),
+		}).Create(status).Error
+	}); err != nil {
 		return nil, err
 	}
 
@@ -372,6 +402,9 @@ func (s *service) persistVersionsWithWriter(
 	}
 	unlock := s.lockVersionWrite(nodeID)
 	defer unlock()
+	if _, removed := s.removedNodes.Load(nodeID); removed {
+		return
+	}
 	snap := s.ensureNode(nodeID)
 	s.mu.RLock()
 	prevVersions := append([]ComponentVersion(nil), snap.Versions...)
@@ -465,6 +498,12 @@ func (s *service) writeVersions(nodeID string, versions []ComponentVersion, inve
 		keep = append(keep, v.Component)
 	}
 	return s.db.Transaction(func(tx *gorm.DB) error {
+		var registration models.NodeRegistration
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("node_id = ?", nodeID).
+			First(&registration).Error; err != nil {
+			return err
+		}
 		if len(rows) > 0 {
 			if err := tx.Clauses(clause.OnConflict{
 				Columns: []clause.Column{{Name: "node_id"}, {Name: "component"}},
@@ -589,7 +628,13 @@ func fanOutResourceMetric(ctx context.Context, nodeID string, req *UpdateNodeSta
 }
 
 func GetNode(ctx context.Context, nodeID string) (*NodeSnapshot, error) {
-	_ = ctx
+	exists, err := global.nodeRegistrationExists(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, gorm.ErrRecordNotFound
+	}
 	global.mu.RLock()
 	defer global.mu.RUnlock()
 	snap, ok := global.nodes[nodeID]
@@ -600,16 +645,36 @@ func GetNode(ctx context.Context, nodeID string) (*NodeSnapshot, error) {
 }
 
 func ListNodes(ctx context.Context) ([]*NodeSnapshot, error) {
-	_ = ctx
+	var registeredIDs []string
+	if err := global.db.WithContext(ctx).Model(&models.NodeRegistration{}).
+		Pluck("node_id", &registeredIDs).Error; err != nil {
+		return nil, err
+	}
+	registered := make(map[string]struct{}, len(registeredIDs))
+	for _, nodeID := range registeredIDs {
+		registered[nodeID] = struct{}{}
+	}
 	global.mu.RLock()
 	defer global.mu.RUnlock()
 	out := make([]*NodeSnapshot, 0, len(global.nodes))
 	now := time.Now()
-	for _, snap := range global.nodes {
+	for nodeID, snap := range global.nodes {
+		if _, ok := registered[nodeID]; !ok {
+			continue
+		}
 		out = append(out, cloneSnapshotWithCurrentHealth(snap, now))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out, nil
+}
+
+func (s *service) nodeRegistrationExists(ctx context.Context, nodeID string) (bool, error) {
+	var count int64
+	if err := s.db.WithContext(ctx).Model(&models.NodeRegistration{}).
+		Where("node_id = ?", nodeID).Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func ListSchedulerNodes(ctx context.Context) ([]*node.Node, error) {
@@ -906,8 +971,9 @@ func (s *service) reload() error {
 	for _, st := range statuses {
 		snap, ok := next[st.NodeID]
 		if !ok {
-			snap = &NodeSnapshot{NodeID: st.NodeID}
-			next[st.NodeID] = snap
+			// Registration is authoritative. Ignore orphan status rows left by
+			// legacy versions or an interrupted cleanup.
+			continue
 		}
 		_ = json.Unmarshal([]byte(st.ConditionsJSON), &snap.Conditions)
 		_ = json.Unmarshal([]byte(st.ImagesJSON), &snap.Images)
@@ -923,8 +989,9 @@ func (s *service) reload() error {
 	for _, v := range versions {
 		snap, ok := next[v.NodeID]
 		if !ok {
-			snap = &NodeSnapshot{NodeID: v.NodeID}
-			next[v.NodeID] = snap
+			// Never resurrect a deleted node from a non-authoritative version
+			// row.
+			continue
 		}
 		snap.Versions = append(snap.Versions, ComponentVersion{
 			Component: v.Component,
@@ -947,9 +1014,33 @@ func (s *service) reload() error {
 // nodes whose cordon state changed are synced to localcache.
 func (s *service) applyReloadResult(next map[string]*NodeSnapshot) {
 	toSync := make([]*NodeSnapshot, 0)
+	toRemove := make([]string, 0)
+	now := time.Now()
 
 	s.mu.Lock()
+	for nodeID, existing := range s.nodes {
+		if _, exists := next[nodeID]; exists {
+			continue
+		}
+		// A reload may race a fresh registration that has not sent its first
+		// status yet. Only prune an absent node after a previously observed
+		// heartbeat has expired; explicit deletion removes it immediately on
+		// the handling replica.
+		if snapshotSchedulingDisabled(existing) ||
+			(!existing.HeartbeatTime.IsZero() && now.Sub(existing.HeartbeatTime) > healthTimeout()) {
+			delete(s.nodes, nodeID)
+			toRemove = append(toRemove, nodeID)
+		}
+	}
 	for nodeID, newSnap := range next {
+		if removedGeneration, removed := s.removedNodes.Load(nodeID); removed {
+			if removedGeneration.(uint) == newSnap.registrationID {
+				continue
+			}
+			// The database now contains a different registration generation,
+			// possibly created through another CubeMaster replica.
+			s.removedNodes.Delete(nodeID)
+		}
 		if existing, ok := s.nodes[nodeID]; ok {
 			prevDisabled := snapshotSchedulingDisabled(existing)
 
@@ -965,6 +1056,7 @@ func (s *service) applyReloadResult(next map[string]*NodeSnapshot) {
 			existing.MaxMvmNum = newSnap.MaxMvmNum
 			existing.HostIP = newSnap.HostIP
 			existing.GRPCPort = newSnap.GRPCPort
+			existing.registrationID = newSnap.registrationID
 			existing.Versions = append([]ComponentVersion(nil), newSnap.Versions...)
 			existing.versionsHash = newSnap.versionsHash
 			if newSnap.HeartbeatTime.After(existing.HeartbeatTime) {
@@ -990,6 +1082,9 @@ func (s *service) applyReloadResult(next map[string]*NodeSnapshot) {
 	}
 	for _, snap := range toSync {
 		syncLocalcache(snap)
+	}
+	for _, nodeID := range toRemove {
+		localcache.RemoveNode(nodeID)
 	}
 }
 

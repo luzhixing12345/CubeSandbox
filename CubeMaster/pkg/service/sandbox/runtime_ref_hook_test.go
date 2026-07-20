@@ -7,8 +7,15 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
+	"github.com/agiledragon/gomonkey/v2"
+	cubebox "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
+	cubeleterrorcode "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/errorcode/v1"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 )
 
@@ -60,6 +67,47 @@ func TestCreateHookChain_FIFO(t *testing.T) {
 	}
 	if len(order) != 2 || order[0] != "a:sbx-y" || order[1] != "b:sbx-y" {
 		t.Fatalf("hooks order wrong: %v", order)
+	}
+}
+
+func TestDealSuccResultKeepsSpecPersistenceFailure(t *testing.T) {
+	ResetAfterCreateSandboxSuccessHooks()
+	defer ResetAfterCreateSandboxSuccessHooks()
+
+	wantErr := errors.New("spec database unavailable")
+	RegisterAfterCreateSandboxSuccessHook(func(context.Context, string, string, string, *types.CreateCubeSandboxReq) error {
+		return wantErr
+	})
+	patch := gomonkey.ApplyFunc(config.GetConfig, func() *config.Config {
+		return &config.Config{CubeletConf: &config.CubeletConf{}}
+	})
+	defer patch.Reset()
+
+	req := &types.CreateCubeSandboxReq{}
+	c := &createSandboxContext{
+		ctx:        withCreateOriginRequest(context.Background(), req),
+		selectHost: &node.Node{InsID: "node-1", IP: "10.0.0.1"},
+		cubeletReq: &cubebox.RunCubeSandboxRequest{InstanceType: "test-no-proxy"},
+		cubeletRsp: &cubebox.RunCubeSandboxResponse{
+			Ret:       &cubeleterrorcode.Ret{RetCode: cubeleterrorcode.ErrorCode_Success},
+			SandboxID: "sandbox-1",
+		},
+		masterRsp: &types.CreateCubeSandboxRes{
+			Ret:     &types.Ret{},
+			ExtInfo: map[string]string{},
+		},
+	}
+
+	c.dealSuccResult()
+
+	if c.masterRsp.Ret.RetCode != int(errorcode.ErrorCode_DBError) {
+		t.Fatalf("RetCode = %d, want DBError", c.masterRsp.Ret.RetCode)
+	}
+	if !strings.Contains(c.masterRsp.Ret.RetMsg, wantErr.Error()) {
+		t.Fatalf("RetMsg = %q, want persistence error", c.masterRsp.Ret.RetMsg)
+	}
+	if c.masterRsp.SandboxID == "" {
+		t.Fatal("sandbox ID must remain populated so failover can destroy it")
 	}
 }
 

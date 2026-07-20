@@ -35,6 +35,9 @@ func (f *fakeCMHandler) ClusterVersions(ctx context.Context) (json.RawMessage, e
 func (f *fakeCMHandler) GetNode(ctx context.Context, nodeID string) (json.RawMessage, error) {
 	return nil, errMethodNotConfigured("GetNode")
 }
+func (f *fakeCMHandler) DeleteNode(ctx context.Context, nodeID string) (json.RawMessage, error) {
+	return nil, errMethodNotConfigured("DeleteNode")
+}
 func (f *fakeCMHandler) ListSandboxes(ctx context.Context) (json.RawMessage, error) {
 	return nil, errMethodNotConfigured("ListSandboxes")
 }

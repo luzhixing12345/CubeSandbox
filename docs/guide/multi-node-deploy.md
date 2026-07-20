@@ -159,6 +159,24 @@ sudo ./down.sh
 
 In compute-node mode, this only stops `cubelet` and `network-agent`. It does not affect the control plane or other compute nodes.
 
+### Permanently Remove a Compute Node
+
+Stopping services does not remove the node from CubeMaster. To decommission it safely:
+
+1. Prevent new sandbox placement:
+   ```bash
+   cubemastercli node isolate <node-id>
+   ```
+2. Migrate or destroy every sandbox on the node. Pausing alone does not drain it. Complete any template and artifact cleanup associated with the node.
+3. While Cubelet is still reachable, remove the drained node:
+   ```bash
+   cubemastercli node remove --yes <node-id>
+   ```
+   CubeMaster verifies the live Cubelet inventory is empty before committing removal.
+4. Stop the compute-node services so they no longer attempt heartbeats.
+
+Removal is rejected unless the node is isolated and has no sandbox specs, active snapshot runtime references, template replicas, or artifact placements. A heartbeat timeout only marks a node unhealthy; it is not a removal operation. Reinstalling the node later registers the same node ID as a new active node.
+
 ### Reinstall
 
 To reinstall a compute node, simply run `install-compute.sh` again. The script automatically stops the existing deployment before installing.

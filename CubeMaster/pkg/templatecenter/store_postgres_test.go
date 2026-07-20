@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db/models"
 )
 
 func TestUpsertReplicaPostgreSQLUpdatePath(t *testing.T) {
@@ -21,6 +22,11 @@ func TestUpsertReplicaPostgreSQLUpdatePath(t *testing.T) {
 
 	ctx := context.Background()
 	templateID := "tpl-pg-upsert"
+	require.NoError(t, store.db.Create(&models.NodeRegistration{
+		NodeID:     "node-a",
+		HostIP:     "10.0.0.1",
+		LabelsJSON: "{}",
+	}).Error)
 	replica := ReplicaStatus{
 		NodeID: "node-a",
 		NodeIP: "10.0.0.1",

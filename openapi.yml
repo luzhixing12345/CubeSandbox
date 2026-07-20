@@ -1,8 +1,3 @@
----
-# Copyright (c) 2026 Tencent Inc.
-# SPDX-License-Identifier: Apache-2.0
-#
-
 openapi: 3.1.0
 info:
   title: CubeAPI
@@ -126,6 +121,44 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+    delete:
+      tags:
+      - handlers::cluster
+      operationId: delete_node
+      parameters:
+      - name: nodeID
+        in: path
+        description: Node identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Node removed
+        '400':
+          description: Invalid node identifier
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '404':
+          description: Node not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '409':
+          description: 'Removal blocked: node is not isolated/reachable, sandbox creation is in progress, or sandbox specs, active runtime refs, template replicas, or artifact placements remain'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: Unexpected backend error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /sandboxes/{sandboxID}:
     get:
       tags:
@@ -192,7 +225,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiError'
         '503':
-          description: Sandbox is pausing or another lifecycle operation is in progress (Retry-After 2); the Cubelet RPC has too little remaining time or its internal resume could not be completed (Retry-After 5)
+          description: Sandbox is pausing, another lifecycle operation is in progress, the Cubelet RPC has too little remaining time, or its internal resume could not be completed
           headers:
             Retry-After:
               schema:
@@ -623,7 +656,6 @@ components:
       - sandboxID
       - clientID
       - startedAt
-      - endAt
       - cpuCount
       - memoryMB
       - state
@@ -644,8 +676,13 @@ components:
           - 'null'
           format: int32
         endAt:
-          type: string
+          type:
+          - string
+          - 'null'
           format: date-time
+          description: |-
+            Projected next-timeout instant. Omitted for never-timeout sandboxes
+            (no deadline) rather than being misreported as equal to startedAt.
         envdVersion:
           type: string
         memoryMB:
@@ -813,8 +850,11 @@ components:
         autoPause:
           type: boolean
         timeout:
-          type: integer
+          type:
+          - integer
+          - 'null'
           format: int32
+          description: Idle timeout in seconds; None when the client did not send one.
     Sandbox:
       type: object
       description: |-
@@ -858,7 +898,6 @@ components:
       - sandboxID
       - clientID
       - startedAt
-      - endAt
       - envdVersion
       - cpuCount
       - memoryMB
@@ -883,8 +922,13 @@ components:
           - string
           - 'null'
         endAt:
-          type: string
+          type:
+          - string
+          - 'null'
           format: date-time
+          description: |-
+            Projected next-timeout instant. Omitted for never-timeout sandboxes
+            (no deadline) rather than being misreported as equal to startedAt.
         envdAccessToken:
           type:
           - string
@@ -1040,15 +1084,15 @@ components:
           - 'null'
           description: Whether public internet access is allowed for sandboxes from this template.
         createRequest: {}
+        instanceType:
+          type:
+          - string
+          - 'null'
         jobID:
           type:
           - string
           - 'null'
           description: Latest create/rebuild job id for the template.
-        instanceType:
-          type:
-          - string
-          - 'null'
         lastError:
           type:
           - string
@@ -1126,6 +1170,11 @@ components:
           type:
           - string
           - 'null'
+        jobID:
+          type:
+          - string
+          - 'null'
+          description: Latest create/rebuild job id for the template.
         lastError:
           type:
           - string
@@ -1138,11 +1187,6 @@ components:
           type:
           - string
           - 'null'
-        jobID:
-          type:
-          - string
-          - 'null'
-          description: Latest create/rebuild job id for the template.
     VersionMatrixView:
       type: object
       description: Full node x component version matrix.

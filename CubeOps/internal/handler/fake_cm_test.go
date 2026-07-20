@@ -23,6 +23,7 @@ type fakeCM struct {
 	getNodes                    func(ctx context.Context) (json.RawMessage, error)
 	clusterVersions             func(ctx context.Context) (json.RawMessage, error)
 	getNode                     func(ctx context.Context, nodeID string) (json.RawMessage, error)
+	deleteNode                  func(ctx context.Context, nodeID string) (json.RawMessage, error)
 	listSandboxes               func(ctx context.Context) (json.RawMessage, error)
 	getSandbox                  func(ctx context.Context, sandboxID, instanceType string) (json.RawMessage, error)
 	createSandbox               func(ctx context.Context, body interface{}) (json.RawMessage, error)
@@ -64,6 +65,12 @@ func (f *fakeCM) GetNode(ctx context.Context, nodeID string) (json.RawMessage, e
 		return nil, errFakeNotConfigured
 	}
 	return f.getNode(ctx, nodeID)
+}
+func (f *fakeCM) DeleteNode(ctx context.Context, nodeID string) (json.RawMessage, error) {
+	if f.deleteNode == nil {
+		return nil, errFakeNotConfigured
+	}
+	return f.deleteNode(ctx, nodeID)
 }
 func (f *fakeCM) ListSandboxes(ctx context.Context) (json.RawMessage, error) {
 	if f.listSandboxes == nil {

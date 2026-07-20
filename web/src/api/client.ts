@@ -269,6 +269,8 @@ export const clusterApi = {
   overview: () => ops<ClusterOverviewDto>('/cluster/overview'),
   nodes: () => ops<ApiNodeView[]>('/nodes').then((items) => items.map(mapNode)),
   node: (id: string) => ops<ApiNodeView>(`/nodes/${id}`).then(mapNode),
+  removeNode: (id: string) =>
+    ops<void>(`/nodes/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   config: () =>
     ops<{
       apiEndpoint: string;

@@ -46,11 +46,12 @@ var nodeIsolationFlags = []cli.Flag{
 var NodeCommand = cli.Command{
 	Name:    "node",
 	Aliases: []string{"nodes"},
-	Usage:   "list / isolate / unisolate cubemaster nodes",
+	Usage:   "list / isolate / unisolate / remove cubemaster nodes",
 	Subcommands: cli.Commands{
 		NodeListCommand,
 		NodeIsolateCommand,
 		NodeUnisolateCommand,
+		NodeRemoveCommand,
 	},
 }
 
@@ -134,6 +135,39 @@ var NodeUnisolateCommand = cli.Command{
 	},
 }
 
+var NodeRemoveCommand = cli.Command{
+	Name:      "remove",
+	Aliases:   []string{"delete", "rm"},
+	Usage:     "permanently remove isolated, fully drained node(s)",
+	ArgsUsage: "<node-id> [node-id ...]",
+	Flags: []cli.Flag{
+		cli.BoolFlag{Name: "yes", Usage: "confirm permanent node removal"},
+		cli.BoolFlag{Name: "json", Usage: "print raw json response"},
+	},
+	Action: func(c *cli.Context) error {
+		if !c.Bool("yes") {
+			return errors.New("node removal requires --yes")
+		}
+		if c.NArg() == 0 {
+			return errors.New("node id is required")
+		}
+		serverList = getServerAddrs(c)
+		if len(serverList) == 0 {
+			return errors.New("no server addr")
+		}
+		port = c.GlobalString("port")
+
+		var opErr error
+		for _, nodeID := range c.Args() {
+			if err := removeOneNode(c, nodeID); err != nil {
+				log.Printf("remove failed: %s %s\n", nodeID, err.Error())
+				opErr = errors.Join(opErr, fmt.Errorf("%s: %w", nodeID, err))
+			}
+		}
+		return opErr
+	},
+}
+
 func doNodeIsolation(c *cli.Context, method string) error {
 	if c.NArg() == 0 {
 		cmd := "unisolate"
@@ -195,6 +229,32 @@ func isolateOneNode(c *cli.Context, method, nodeID string) error {
 		nodeID = rsp.Data.NodeID
 	}
 	fmt.Printf("node %s %s: scheduling_disabled=%t\n", nodeID, isolationAction(method), disabled)
+	return nil
+}
+
+func removeOneNode(c *cli.Context, nodeID string) error {
+	requestID := uuid.New().String()
+	host := serverList[rand.Int()%len(serverList)]
+	u := &url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(host, port),
+		Path:   "/internal/meta/nodes/" + url.PathEscape(nodeID),
+	}
+	rsp := &nodeMetaResponse{}
+	if err := doHttpReq(c, u.String(), http.MethodDelete, requestID, bytes.NewReader(nil), rsp); err != nil {
+		return err
+	}
+	if rsp.Ret == nil {
+		return errors.New("empty response")
+	}
+	if rsp.Ret.RetCode != 200 {
+		return errors.New(rsp.Ret.RetMsg)
+	}
+	if c.Bool("json") {
+		commands.PrintAsJSON(rsp)
+		return nil
+	}
+	fmt.Printf("node %s removed\n", nodeID)
 	return nil
 }
 
