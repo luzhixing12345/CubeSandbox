@@ -1,0 +1,29 @@
+[Unit]
+Description=Cube Sandbox Hybrid JuiceFS and nbdkit data plane
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+Before=cube-sandbox-cubelet.service
+ConditionPathExists=/usr/local/services/cubetoolbox/.one-click.env
+RequiresMountsFor=/data/cubelet
+
+[Service]
+Type=exec
+EnvironmentFile=-/usr/local/services/cubetoolbox/.one-click.env
+ExecStart=/usr/bin/bash /usr/local/services/cubetoolbox/scripts/systemd/cube-hybrid-mount.sh start
+# Readiness gate: the socket must exist AND the remote dir must be a JuiceFS
+# mount. The mount check matches a LINE, not the whole output: the remote dir is
+# bind-mounted onto itself on top of the data disk, so `findmnt -T` reports the
+# underlying xfs mount plus the JuiceFS entries. Comparing the entire output to
+# "fuse.juicefs" never matches and left the unit stuck in activating until
+# TimeoutStartSec.
+ExecStartPost=/usr/bin/bash -c 'for i in $(seq 1 120); do test -S "${CUBE_HYBRID_SOCKET_PATH:-/run/cubestor.sock}" && findmnt -rn -T "${CUBE_HYBRID_REMOTE_DIR:-/data/cubelet/storage/hybrid/remote}" -o FSTYPE 2>/dev/null | grep -qx "fuse.juicefs" && exit 0; sleep 1; done; exit 1'
+ExecStop=/usr/bin/bash /usr/local/services/cubetoolbox/scripts/systemd/cube-hybrid-mount.sh stop
+Restart=on-failure
+RestartSec=3s
+TimeoutStartSec=120s
+TimeoutStopSec=60s
+
+[Install]
+WantedBy=cube-sandbox-control.target
+WantedBy=cube-sandbox-compute.target

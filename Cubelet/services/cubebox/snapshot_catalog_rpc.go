@@ -26,7 +26,7 @@ func (s *service) ListLocalSnapshots(ctx context.Context, req *cubebox.ListLocal
 		Ret:       &errorcode.Ret{RetCode: errorcode.ErrorCode_Success},
 	}
 	filter := strings.TrimSpace(req.GetBackend())
-	backends := []string{cow.BackendXFS, cow.BackendS3, cow.BackendJFS}
+	backends := []string{cow.BackendXFS, cow.BackendS3, cow.BackendJFS, cow.BackendHybrid}
 	if filter != "" {
 		normalized, err := resolveRequestStorageBackend(filter)
 		if err != nil {

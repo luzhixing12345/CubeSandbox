@@ -18,6 +18,10 @@ const (
 	// volume every node mounts. Another node restores a package straight
 	// from the origin's tree once JuiceFS has uploaded its blocks.
 	SnapshotBackendJFS = "jfs"
+	// SnapshotBackendHybrid exposes a local-XFS overlay over a shared baseline
+	// through cubestor/nbdkit. The first implementation is node-local and does
+	// not advertise cross-node readiness.
+	SnapshotBackendHybrid = "hybrid"
 
 	// RemoteStatus* are remote publish states on snapshot / pause-snapshot
 	// rows (s3 upload, jfs). Empty on xfs. Create starts pending;
@@ -30,7 +34,8 @@ const (
 	RemoteStatusFailed     = "failed"
 )
 
-// NormalizeSnapshotBackend maps create/pause backend input onto xfs | s3 | jfs.
+// NormalizeSnapshotBackend maps create/pause backend input onto
+// xfs | s3 | jfs | hybrid.
 // Empty and historical cubecow aliases become xfs.
 func NormalizeSnapshotBackend(raw string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
@@ -40,9 +45,11 @@ func NormalizeSnapshotBackend(raw string) (string, error) {
 		return SnapshotBackendS3, nil
 	case SnapshotBackendJFS, "juicefs":
 		return SnapshotBackendJFS, nil
+	case SnapshotBackendHybrid, "cubestor":
+		return SnapshotBackendHybrid, nil
 	default:
-		return "", fmt.Errorf("unsupported backend %q (want %q, %q or %q)", raw,
-			SnapshotBackendXFS, SnapshotBackendS3, SnapshotBackendJFS)
+		return "", fmt.Errorf("unsupported backend %q (want %q, %q, %q or %q)", raw,
+			SnapshotBackendXFS, SnapshotBackendS3, SnapshotBackendJFS, SnapshotBackendHybrid)
 	}
 }
 
@@ -85,15 +92,32 @@ func IsJFSBackend(backend string) bool {
 	return err == nil && normalized == SnapshotBackendJFS
 }
 
+// IsHybridBackend reports whether backend is the local-XFS overlay over a
+// shared baseline. Its shared half lives in one JuiceFS directory that every
+// node mounts, so a template must be built exactly once, like a JFS template.
+func IsHybridBackend(backend string) bool {
+	normalized, err := NormalizeSnapshotBackend(backend)
+	return err == nil && normalized == SnapshotBackendHybrid
+}
+
+// IsSharedRemoteBackend reports whether backend keeps its template and
+// snapshot objects in a remote tree that every node mounts. Building the same
+// template concurrently on several nodes would race on identical object names
+// in that tree, so such a backend must build on a single node.
+func IsSharedRemoteBackend(backend string) bool {
+	return IsJFSBackend(backend) || IsHybridBackend(backend)
+}
+
 // IsRemoteTrackedBackend reports whether rows of backend carry
-// remote_status / export_uuids (s3 export, jfs shared volume).
+// remote_status / export_uuids (s3 export, jfs shared volume, hybrid overlay
+// publish).
 func IsRemoteTrackedBackend(backend string) bool {
-	return IsS3Backend(backend) || IsJFSBackend(backend)
+	return IsS3Backend(backend) || IsJFSBackend(backend) || IsHybridBackend(backend)
 }
 
 // RemoteTrackedBackends lists the backends the remote_status poller scans.
 func RemoteTrackedBackends() []string {
-	return []string{SnapshotBackendS3, SnapshotBackendJFS}
+	return []string{SnapshotBackendS3, SnapshotBackendJFS, SnapshotBackendHybrid}
 }
 
 // SnapshotRemoteStatus returns the default remote_status for a normalized

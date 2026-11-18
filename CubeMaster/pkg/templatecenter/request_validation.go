@@ -70,10 +70,20 @@ func resolveTemplateNodes(instanceType string, scope []string) ([]*node.Node, er
 	return selected, nil
 }
 
-// templateBuildTargets narrows the nodes a template is built on. JFS shares
-// files but not CPU/kernel restore compatibility, so one representative of
-// every known host-fact class builds a physical template variant.
+// templateBuildTargets narrows the nodes a template is built on.
+//
+// hybrid keeps its template objects in the shared remote directory that every
+// node mounts, so it builds on exactly one node: two nodes creating the same
+// <template>-build-rootfs in that directory would race, and the loser fails
+// with "already exists".
+//
+// JFS also shares files, but it additionally partitions templates by CPU/kernel
+// restore compatibility, so one representative of every known host-fact class
+// builds a physical variant.
 func templateBuildTargets(backend string, variants bool, nodes []*node.Node) []*node.Node {
+	if constants.IsHybridBackend(backend) {
+		return pickBuildNode(nodes)
+	}
 	if !constants.IsJFSBackend(backend) || !variants {
 		return nodes
 	}
@@ -108,6 +118,29 @@ func templateBuildTargets(backend string, variants bool, nodes []*node.Node) []*
 		targets = append(targets, candidates[rand.Intn(len(candidates))])
 	}
 	return targets
+}
+
+// pickBuildNode returns at most one node, preferring a schedulable one. It is
+// how a shared-remote backend (hybrid) serializes template construction onto a
+// single writer of the shared object namespace.
+func pickBuildNode(nodes []*node.Node) []*node.Node {
+	candidates := make([]*node.Node, 0, len(nodes))
+	for _, n := range nodes {
+		if n != nil && n.SchedulingAllowed() {
+			candidates = append(candidates, n)
+		}
+	}
+	if len(candidates) == 0 {
+		for _, n := range nodes {
+			if n != nil {
+				candidates = append(candidates, n)
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	return candidates[:1]
 }
 
 func normalizeTemplateImageRequest(req *types.CreateTemplateFromImageReq) (*types.CreateTemplateFromImageReq, error) {

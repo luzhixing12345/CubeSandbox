@@ -72,17 +72,31 @@ func normalizeSnapshotKind(kind string) string {
 
 func backendDirName(backend string) string {
 	normalized, err := cow.NormalizeBackend(backend)
-	if err == nil && normalized == cow.BackendS3 {
-		return cow.BackendS3
+	if err == nil {
+		switch normalized {
+		case cow.BackendS3:
+			return cow.BackendS3
+		case cow.BackendHybrid:
+			return cow.BackendHybrid
+		}
 	}
 	return cow.BackendXFS
 }
 
 // BackendStorageRoot is <work>/xfs or <work>/s3, and [JFSStorageRoot] on the
 // JuiceFS mount for jfs.
+//
+// Hybrid keeps its package metadata next to its shared baseline instead: the
+// template catalog, sandbox spec and hypervisor state must be readable from
+// every node, exactly like jfs. Its local XFS directory holds only the overlay
+// page maps, so metadata under <work>/hybrid would strand every template on the
+// node that built it.
 func BackendStorageRoot(backend string) string {
 	if isJFSBackend(backend) {
 		return JFSStorageRoot()
+	}
+	if isHybridBackend(backend) {
+		return HybridStorageRoot()
 	}
 	return filepath.Join(CubeletStorageWorkPath(), backendDirName(backend))
 }

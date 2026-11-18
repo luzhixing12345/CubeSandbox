@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubecow"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
 	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
@@ -277,4 +278,43 @@ func (l *local) closeJFSCow() {
 func isJFSBackend(backend string) bool {
 	normalized, err := cow.NormalizeBackend(backend)
 	return err == nil && normalized == cow.BackendJFS
+}
+
+func isHybridBackend(backend string) bool {
+	normalized, err := cow.NormalizeBackend(backend)
+	return err == nil && normalized == cow.BackendHybrid
+}
+
+// HybridStorageRoot is the shared root for hybrid package metadata
+// (<shared_dir>/hybrid). It must live on the shared remote directory, not on
+// the local XFS, so every node resolves the same template catalog.
+func HybridStorageRoot() string {
+	var cfg *Config
+	if localStorage != nil {
+		cfg = localStorage.config
+	}
+	return cfg.hybridStorageRoot()
+}
+
+func (c *Config) hybridStorageRoot() string {
+	root := filepath.Join(c.hybridSharedDir(), cow.BackendHybrid)
+	return filepath.Clean(root)
+}
+
+// hybridSharedDir mirrors newHybridStore's default so metadata paths and the
+// cubestor shared image directory always agree.
+func (c *Config) hybridSharedDir() string {
+	if c != nil {
+		if p := strings.TrimSpace(c.Cow.Hybrid.SharedDir); p != "" {
+			return filepath.Clean(p)
+		}
+	}
+	dataPath := ""
+	if c != nil {
+		dataPath = stripStoragePluginDataDir(c.DataPath)
+	}
+	if strings.TrimSpace(dataPath) == "" {
+		dataPath = filepath.Join(constants.CubeConfigBasePath, "storage")
+	}
+	return filepath.Join(filepath.Clean(dataPath), cow.BackendHybrid, "remote")
 }

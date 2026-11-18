@@ -21,11 +21,11 @@ import (
 	cubeboxv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
-// jfs keeps replica rows meaning "built the shared package": distribution
-// only caches the ext4 and must not fabricate replica rows, on any alias
-// or spelling of the backend.
+// jfs and hybrid keep replica rows meaning "built the shared package":
+// distribution only caches the ext4 and must not fabricate replica rows, on any
+// alias or spelling of the backend.
 func TestDistributionTracksReplicas(t *testing.T) {
-	for _, backend := range []string{"jfs", "JuiceFS", "juicefs"} {
+	for _, backend := range []string{"jfs", "JuiceFS", "juicefs", "hybrid", "cubestor"} {
 		if distributionTracksReplicas(backend) {
 			t.Fatalf("backend %q must not track replica rows during distribution", backend)
 		}
@@ -34,6 +34,30 @@ func TestDistributionTracksReplicas(t *testing.T) {
 		if !distributionTracksReplicas(backend) {
 			t.Fatalf("backend %q must track replica rows during distribution", backend)
 		}
+	}
+}
+
+// hybrid stores its template objects in the shared remote directory every node
+// mounts, so exactly one node may build it; two nodes creating the same
+// <template>-build-rootfs there fail with "already exists".
+func TestTemplateBuildTargetsBuildsHybridOnOneNode(t *testing.T) {
+	a, b, c := testNode("a", "10.0.0.1"), testNode("b", "10.0.0.2"), testNode("c", "10.0.0.3")
+	a.SetSchedulingDisabled(true)
+	b.SetSchedulingDisabled(true)
+	all := []*node.Node{a, b, c}
+
+	for i := 0; i < 20; i++ {
+		got := templateBuildTargets("hybrid", true, all)
+		if len(got) != 1 || got[0] != c {
+			t.Fatalf("hybrid targets = %+v, want only the schedulable node", got)
+		}
+	}
+	// hybrid ignores host-fact variants: it is one package on a shared volume.
+	if got := templateBuildTargets("hybrid", false, all); len(got) != 1 || got[0] != c {
+		t.Fatalf("hybrid targets without variants = %+v, want one node", got)
+	}
+	if got := templateBuildTargets("hybrid", true, nil); len(got) != 0 {
+		t.Fatalf("hybrid targets of no node = %d", len(got))
 	}
 }
 

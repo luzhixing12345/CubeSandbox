@@ -146,7 +146,7 @@ func hasActiveJFSJob(targets *templateCleanupTargets) bool {
 	if targets == nil || !targets.hasActiveJob() {
 		return false
 	}
-	if targets.Definition != nil && constants.IsJFSBackend(targets.Definition.StorageBackend) {
+	if targets.Definition != nil && constants.IsSharedRemoteBackend(targets.Definition.StorageBackend) {
 		return true
 	}
 	for _, job := range targets.Jobs {
@@ -158,7 +158,7 @@ func hasActiveJFSJob(targets *templateCleanupTargets) bool {
 		var req struct {
 			Backend string `json:"backend"`
 		}
-		if err := json.Unmarshal([]byte(job.RequestJSON), &req); err == nil && constants.IsJFSBackend(req.Backend) {
+		if err := json.Unmarshal([]byte(job.RequestJSON), &req); err == nil && constants.IsSharedRemoteBackend(req.Backend) {
 			return true
 		}
 	}

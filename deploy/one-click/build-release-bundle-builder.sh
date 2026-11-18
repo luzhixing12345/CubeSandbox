@@ -508,6 +508,31 @@ done
 ensure_dir "${PREBUILT_DIR}/s3lvol"
 ensure_file "${PREBUILT_DIR}/s3lvol/bin/s3lvol_tgt"
 
+# Hybrid storage is developed in the sibling nbdkit checkout. This temporary
+# bundle integration deliberately packages the already-built artifacts instead
+# of rebuilding that repository inside CubeSandbox's builder image.
+#
+# ROOT_DIR can be reached through a symlink (e.g. /root/CubeSandbox ->
+# /data/CubeSandbox). Resolving ".." from the logical path would yield
+# /root/nbdkit and never find the checkout, so take the physical root first and
+# look for the sibling from its real parent directory.
+if [[ -z "${NBDKIT_REPO_DIR:-}" ]]; then
+  CUBE_SANDBOX_ROOT_PHYSICAL="$(cd -P "${ROOT_DIR}" && pwd -P)"
+  NBDKIT_REPO_DIR="${CUBE_SANDBOX_ROOT_PHYSICAL%/*}/nbdkit"
+fi
+NBDKIT_BIN_SRC="${NBDKIT_BIN_SRC:-${NBDKIT_REPO_DIR}/build/server/nbdkit}"
+CUBESTORCLI_BIN_SRC="${CUBESTORCLI_BIN_SRC:-${NBDKIT_REPO_DIR}/build/plugins/cubestor/cubestorcli}"
+NBDKIT_CUBESTOR_PLUGIN_SRC="${NBDKIT_CUBESTOR_PLUGIN_SRC:-${NBDKIT_REPO_DIR}/build/plugins/cubestor/.libs/nbdkit-cubestor-plugin.so}"
+for hybrid_src in \
+  "${NBDKIT_BIN_SRC}" \
+  "${CUBESTORCLI_BIN_SRC}" \
+  "${NBDKIT_CUBESTOR_PLUGIN_SRC}"; do
+  [[ -f "${hybrid_src}" ]] || die "required file not found: ${hybrid_src} (build the nbdkit repository at ${NBDKIT_REPO_DIR}, or point NBDKIT_BIN_SRC / CUBESTORCLI_BIN_SRC / NBDKIT_CUBESTOR_PLUGIN_SRC at prebuilt artifacts)"
+done
+install -m 0755 "${NBDKIT_BIN_SRC}" "${PREBUILT_DIR}/nbdkit"
+install -m 0755 "${CUBESTORCLI_BIN_SRC}" "${PREBUILT_DIR}/cubestorcli"
+install -m 0755 "${NBDKIT_CUBESTOR_PLUGIN_SRC}" "${PREBUILT_DIR}/nbdkit-cubestor-plugin.so"
+
 log "packaging one-click release bundle on host with prebuilt artifacts"
 ONE_CLICK_CUBEMASTER_BIN="${PREBUILT_DIR}/cubemaster" \
 ONE_CLICK_CUBEMASTERCLI_BIN="${PREBUILT_DIR}/cubemastercli" \
@@ -525,4 +550,7 @@ ONE_CLICK_CUBESHIM_BIN="${PREBUILT_DIR}/containerd-shim-cube-rs" \
 ONE_CLICK_CUBE_RUNTIME_BIN="${PREBUILT_DIR}/cube-runtime" \
 ONE_CLICK_VOLUME_S3_BIN="${PREBUILT_DIR}/cube-volume-s3" \
 ONE_CLICK_S3LVOL_DIR="${PREBUILT_DIR}/s3lvol" \
+ONE_CLICK_NBDKIT_BIN="${PREBUILT_DIR}/nbdkit" \
+ONE_CLICK_CUBESTORCLI_BIN="${PREBUILT_DIR}/cubestorcli" \
+ONE_CLICK_NBDKIT_CUBESTOR_PLUGIN="${PREBUILT_DIR}/nbdkit-cubestor-plugin.so" \
   "${SCRIPT_DIR}/build-release-bundle.sh" "$@"

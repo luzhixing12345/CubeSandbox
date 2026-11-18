@@ -28,6 +28,16 @@ write_cubelet_jfs_config \
   "${CUBE_JFS_ROOT:-.}" \
   "${CUBE_JFS_CACHE_DIR:-/data/cubelet/jfs-cache}" \
   "${ONE_CLICK_ENABLE_JFS:-0}"
+# Re-apply the Hybrid desired state on every start: a package upgrade replaces
+# config.toml, which would otherwise silently disable a working Hybrid backend.
+# The unit itself still enables the mount explicitly (scripts/cube-hybrid).
+write_cubelet_hybrid_config \
+  "${CUBELET_CONFIG}" \
+  "${CUBE_HYBRID_LOCAL_DIR:-/data/cubelet/storage/hybrid/local}" \
+  "${CUBE_HYBRID_REMOTE_DIR:-/data/cubelet/storage/hybrid/remote}" \
+  "${CUBE_HYBRID_CUBESTORCLI_PATH:-/usr/local/bin/cubestorcli}" \
+  "${CUBE_HYBRID_SOCKET_PATH:-/run/cubestor.sock}" \
+  "${ONE_CLICK_ENABLE_HYBRID:-0}"
 mkdir -p \
   "${TOOLBOX_ROOT}/cube-vs/network" \
   "${TOOLBOX_ROOT}/cube-snapshot" \

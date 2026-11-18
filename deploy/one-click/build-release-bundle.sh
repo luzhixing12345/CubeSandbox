@@ -93,6 +93,9 @@ OPS_AGENT_BIN_OVERRIDE="${ONE_CLICK_OPS_AGENT_BIN:-}"
 CUBEVSMAPDUMP_BIN_OVERRIDE="${ONE_CLICK_CUBEVSMAPDUMP_BIN:-}"
 VOLUME_S3_BIN_OVERRIDE="${ONE_CLICK_VOLUME_S3_BIN:-}"
 S3LVOL_DIR="${ONE_CLICK_S3LVOL_DIR:-}"
+NBDKIT_BIN_OVERRIDE="${ONE_CLICK_NBDKIT_BIN:-}"
+CUBESTORCLI_BIN_OVERRIDE="${ONE_CLICK_CUBESTORCLI_BIN:-}"
+NBDKIT_CUBESTOR_PLUGIN_OVERRIDE="${ONE_CLICK_NBDKIT_CUBESTOR_PLUGIN:-}"
 
 go_version_ldflags() {
   local version_pkg="$1"
@@ -787,15 +790,36 @@ mkdir -p \
   "${PACKAGE_ROOT}/cube-vs/network/bin" \
   "${PACKAGE_ROOT}/cube-snapshot" \
   "${PACKAGE_ROOT}/CubeS3lvol" \
+  "${PACKAGE_ROOT}/hybrid/bin" \
+  "${PACKAGE_ROOT}/hybrid/lib" \
   "${PACKAGE_ROOT}/scripts/one-click" \
   "${PACKAGE_ROOT}/scripts/systemd" \
   "${PACKAGE_ROOT}/scripts/cube-jfs" \
+  "${PACKAGE_ROOT}/scripts/cube-hybrid" \
   "${PACKAGE_ROOT}/scripts/logrotate" \
   "${PACKAGE_ROOT}/scripts/cube-egress" \
   "${PACKAGE_ROOT}/cube-egress" \
   "${PACKAGE_ROOT}/terraform/tencentcloud"
 
 copy_file "${CORE_BIN_DIR}/cubevsmapdump" "${PACKAGE_ROOT}/cube-vs/network/bin/cubevsmapdump"
+
+# Temporary Hybrid backend payload from the sibling nbdkit checkout. The
+# builder wrapper always supplies these overrides; direct invocations may omit
+# Hybrid and keep producing an otherwise valid one-click bundle.
+if [[ -n "${NBDKIT_BIN_OVERRIDE}" || -n "${CUBESTORCLI_BIN_OVERRIDE}" || -n "${NBDKIT_CUBESTOR_PLUGIN_OVERRIDE}" ]]; then
+  ensure_file "${NBDKIT_BIN_OVERRIDE}"
+  ensure_file "${CUBESTORCLI_BIN_OVERRIDE}"
+  ensure_file "${NBDKIT_CUBESTOR_PLUGIN_OVERRIDE}"
+  copy_file "${NBDKIT_BIN_OVERRIDE}" "${PACKAGE_ROOT}/hybrid/bin/nbdkit"
+  copy_file "${CUBESTORCLI_BIN_OVERRIDE}" "${PACKAGE_ROOT}/hybrid/bin/cubestorcli"
+  copy_file "${NBDKIT_CUBESTOR_PLUGIN_OVERRIDE}" "${PACKAGE_ROOT}/hybrid/lib/nbdkit-cubestor-plugin.so"
+  chmod 0755 \
+    "${PACKAGE_ROOT}/hybrid/bin/nbdkit" \
+    "${PACKAGE_ROOT}/hybrid/bin/cubestorcli" \
+    "${PACKAGE_ROOT}/hybrid/lib/nbdkit-cubestor-plugin.so"
+else
+  log "WARN: nbdkit/cubestorcli overrides not set; Hybrid storage payload omitted"
+fi
 
 # Lay down the one-click CubeAPI assets (Dockerfile, etc.) first, then copy the
 # binary on top: copy_dir_contents rm -rf's the destination, so copying the
@@ -937,6 +961,7 @@ fi
 copy_dir_contents "${SCRIPT_DIR}/scripts/one-click" "${PACKAGE_ROOT}/scripts/one-click"
 copy_dir_contents "${SCRIPT_DIR}/scripts/systemd" "${PACKAGE_ROOT}/scripts/systemd"
 copy_dir_contents "${SCRIPT_DIR}/scripts/cube-jfs" "${PACKAGE_ROOT}/scripts/cube-jfs"
+copy_dir_contents "${SCRIPT_DIR}/scripts/cube-hybrid" "${PACKAGE_ROOT}/scripts/cube-hybrid"
 copy_dir_contents "${SCRIPT_DIR}/scripts/logrotate" "${PACKAGE_ROOT}/scripts/logrotate"
 # scripts/{one-click,systemd}/common.sh both `source ../common/validation.sh`,
 # so the shared scripts/common helpers must ship alongside them in the package.
@@ -1049,6 +1074,7 @@ find "${PACKAGE_ROOT}" -type f -path "*/bin/*" -exec chmod +x {} \;
 find "${PACKAGE_ROOT}/scripts/one-click" -type f -name "*.sh" -exec chmod +x {} \;
 find "${PACKAGE_ROOT}/scripts/systemd" -type f -name "*.sh" -exec chmod +x {} \;
 find "${PACKAGE_ROOT}/scripts/cube-jfs" -type f -name "*.sh" -exec chmod +x {} \;
+find "${PACKAGE_ROOT}/scripts/cube-hybrid" -type f -name "*.sh" -exec chmod +x {} \;
 find "${PACKAGE_ROOT}/scripts/logrotate" -type f -name "*.sh" -exec chmod +x {} \;
 find "${PACKAGE_ROOT}/scripts/common" -type f -name "*.sh" -exec chmod +x {} \;
 find "${PACKAGE_ROOT}/scripts/cube-diag" -type f -name "*.sh" -exec chmod +x {} \;

@@ -119,13 +119,14 @@ type snapshotCatalogNS struct {
 
 var (
 	snapshotCatalogMu sync.RWMutex
-	// snapshotCatalogs keeps XFS, S3 and jfs catalogs in separate
+	// snapshotCatalogs keeps XFS, S3, jfs and hybrid catalogs in separate
 	// namespaces. Backend is chosen by the request (or which root was
 	// registered), never by a field inside catalog.json.
 	snapshotCatalogs = map[string]*snapshotCatalogNS{
 		cow.BackendXFS: {index: map[string]*SnapshotCatalogEntry{}},
 		cow.BackendS3:  {index: map[string]*SnapshotCatalogEntry{}},
 		cow.BackendJFS: {index: map[string]*SnapshotCatalogEntry{}},
+		cow.BackendHybrid: {index: map[string]*SnapshotCatalogEntry{}},
 	}
 )
 

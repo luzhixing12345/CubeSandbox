@@ -90,9 +90,10 @@ func CrossNodeImportBackend(backend string) bool {
 
 // RemoteSnapshotBackend reports whether snapshot publication has asynchronous
 // remote readiness. S3 uploads objects; JFS waits for writeback staging to
-// drain even though every node already sees the shared namespace.
+// drain even though every node already sees the shared namespace; hybrid merges
+// the local overlay into the shared image in the background.
 func RemoteSnapshotBackend(backend string) bool {
-	return backend == cow.BackendS3 || backend == cow.BackendJFS
+	return backend == cow.BackendS3 || backend == cow.BackendJFS || backend == cow.BackendHybrid
 }
 
 // SandboxObjectNamePrefix is what every disk minted for a sandbox is named

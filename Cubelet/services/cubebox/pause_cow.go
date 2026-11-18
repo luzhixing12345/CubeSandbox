@@ -841,7 +841,7 @@ func firstPauseSnapshotID(candidates []string, allowCatalogMiss bool, backend st
 
 func lookupPauseCatalog(id, preferred string) (*storage.SnapshotCatalogEntry, string) {
 	seen := map[string]struct{}{}
-	for _, backend := range []string{preferred, cow.BackendS3, cow.BackendXFS, cow.BackendJFS} {
+	for _, backend := range []string{preferred, cow.BackendS3, cow.BackendXFS, cow.BackendJFS, cow.BackendHybrid} {
 		backend = strings.TrimSpace(backend)
 		if backend == "" {
 			continue

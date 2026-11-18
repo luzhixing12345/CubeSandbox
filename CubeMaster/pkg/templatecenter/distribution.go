@@ -113,6 +113,8 @@ func cleanupTemplateReplicasOnNodes(ctx context.Context, templateID string, repl
 	if len(replicas) == 0 || len(targets) == 0 {
 		return nil
 	}
+	// Only JFS records one replica per host-fact variant; hybrid has a single
+	// replica on its build node, so it takes the generic node-scoped path.
 	if constants.IsJFSBackend(backend) {
 		locators := jfsRedoCleanupLocators(templateID, replicas, targets)
 		if len(locators) == 0 {
@@ -212,11 +214,12 @@ func distributeRootfsArtifact(ctx context.Context, req *types.CreateTemplateFrom
 }
 
 // distributionTracksReplicas reports whether a distribution should write
-// per-node replica rows. On jfs a replica row means "built the shared
-// package", which only the build step does; every other backend equates
-// "holds the ext4 artifact" with "has the replica" and keeps both rows.
+// per-node replica rows. On a shared-remote backend (jfs, hybrid) a replica row
+// means "built the shared package", which only the single build step does;
+// every other backend equates "holds the ext4 artifact" with "has the replica"
+// and keeps both rows.
 func distributionTracksReplicas(backend string) bool {
-	return !constants.IsJFSBackend(backend)
+	return !constants.IsSharedRemoteBackend(backend)
 }
 
 // ensureArtifactDistributable refuses to push a CreateImage to cubelets when

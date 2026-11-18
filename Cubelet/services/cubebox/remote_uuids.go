@@ -19,7 +19,13 @@ import (
 // separately through the snapshot status service.
 func uploadRemoteUUIDs(ctx context.Context, backend, snapshotID string) string {
 	normalized, err := cow.NormalizeBackend(backend)
-	if err != nil || !storage.CrossNodeImportBackend(normalized) {
+	if err != nil {
+		return ""
+	}
+	// Hybrid publishes asynchronously: its Uploader returns as soon as the
+	// background merge starts, so this call must not be gated on the S3-only
+	// cross-node-import predicate.
+	if !storage.CrossNodeImportBackend(normalized) && normalized != cow.BackendHybrid {
 		return ""
 	}
 	uuids, err := storage.UploadSnapshot(ctx, normalized, snapshotID)

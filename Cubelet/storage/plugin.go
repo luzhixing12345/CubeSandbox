@@ -133,10 +133,23 @@ type Config struct {
 // Users may tune `[log]` and `[cow.s3]` (s3lvol enable / socket); reflink
 // `root_dir` and s3 `state_dir` are derived from `data_path`.
 type CowInlineConfig struct {
-	Log     CowLogConfig     `toml:"log"`
-	Backend CowBackendConfig `toml:"-"`
-	S3      CowS3UserConfig  `toml:"s3"`
-	JFS     CowJFSUserConfig `toml:"jfs"`
+	Log     CowLogConfig        `toml:"log"`
+	Backend CowBackendConfig    `toml:"-"`
+	S3      CowS3UserConfig     `toml:"s3"`
+	JFS     CowJFSUserConfig    `toml:"jfs"`
+	Hybrid  CowHybridUserConfig `toml:"hybrid"`
+}
+
+// CowHybridUserConfig configures the cubestor/nbdkit local-XFS overlay over a
+// shared POSIX directory. It is deliberately opt-in and node-local in the
+// first implementation; cross-node restore remains gated off in CubeMaster.
+type CowHybridUserConfig struct {
+	Enable           bool   `toml:"enable"`
+	CubestorCLIPath  string `toml:"cubestorcli_path"`
+	SocketPath       string `toml:"socket_path"`
+	LocalDir         string `toml:"local_dir"`
+	SharedDir        string `toml:"shared_dir"`
+	CommandTimeoutMS uint64 `toml:"command_timeout_ms"`
 }
 
 // CowJFSUserConfig is the operator-facing `[cow.jfs]` block. backend=jfs
@@ -464,6 +477,16 @@ func init() {
 			SetSnapshotCatalogRootsFor(cow.BackendS3, catalogKindRoots(cow.BackendS3)...)
 			if localStorage.config.jfsConfigured() {
 				SetSnapshotCatalogRootsFor(cow.BackendJFS, catalogKindRoots(cow.BackendJFS)...)
+			}
+			if localStorage.config.Cow.Hybrid.Enable {
+				SetSnapshotCatalogRootsFor(cow.BackendHybrid, catalogKindRoots(cow.BackendHybrid)...)
+				hybrid, err := newHybridStore(localStorage.config)
+				if err != nil {
+					return nil, fmt.Errorf("initialize hybrid storage: %w", err)
+				}
+				localStorage.hybridManager = hybrid
+				CubeLog.Infof("hybrid storage initialized: socket=%s local=%s shared=%s",
+					hybrid.socketPath, hybrid.localDir, hybrid.sharedDir)
 			}
 			localStorage.initJFSCow(ic.Context)
 

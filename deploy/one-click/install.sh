@@ -1775,6 +1775,13 @@ start_systemd_target() {
     systemctl reset-failed cube-sandbox-jfs.service >/dev/null 2>&1 || true
   fi
 
+  # Hybrid is initialized and mounted explicitly with scripts/cube-hybrid.
+  # Turning the installer switch off must remove stale boot enablement.
+  if [[ "${ONE_CLICK_ENABLE_HYBRID}" != "1" ]]; then
+    systemctl disable --now cube-sandbox-hybrid.service >/dev/null 2>&1 || true
+    systemctl reset-failed cube-sandbox-hybrid.service >/dev/null 2>&1 || true
+  fi
+
   # CubeTemplateCenter is part of the default control-plane stack (CubeMaster
   # has no in-process build fallback). The control target's Wants= already
   # pulls it up; the explicit enable creates the .wants symlink so the unit
@@ -2037,6 +2044,55 @@ fi
 if [[ "${ONE_CLICK_ENABLE_JFS}" == "1" && "${DEPLOY_ROLE}" != "compute" && -z "${CUBE_JFS_BUCKET}" ]]; then
   die "CUBE_JFS_BUCKET is required when JuiceFS is enabled"
 fi
+# Hybrid uses an independent JuiceFS volume only as its remote layer.
+ONE_CLICK_ENABLE_HYBRID="${ONE_CLICK_ENABLE_HYBRID:-0}"
+case "${ONE_CLICK_ENABLE_HYBRID}" in
+  0|1) ;;
+  *) die "ONE_CLICK_ENABLE_HYBRID must be 0 or 1 (got: '${ONE_CLICK_ENABLE_HYBRID}')" ;;
+esac
+CUBE_HYBRID_META_URL="${CUBE_HYBRID_META_URL:-}"
+CUBE_HYBRID_META_PASSWORD="${CUBE_HYBRID_META_PASSWORD:-}"
+CUBE_HYBRID_VOLUME_NAME="${CUBE_HYBRID_VOLUME_NAME:-cube-hybrid}"
+CUBE_HYBRID_STORAGE="${CUBE_HYBRID_STORAGE:-s3}"
+CUBE_HYBRID_BUCKET="${CUBE_HYBRID_BUCKET:-}"
+CUBE_HYBRID_ACCESS_KEY="${CUBE_HYBRID_ACCESS_KEY:-}"
+CUBE_HYBRID_SECRET_KEY="${CUBE_HYBRID_SECRET_KEY:-}"
+CUBE_HYBRID_JFS_IMAGE="${CUBE_HYBRID_JFS_IMAGE:-${CUBE_JFS_IMAGE}}"
+CUBE_HYBRID_JFS_CONTAINER_NAME="${CUBE_HYBRID_JFS_CONTAINER_NAME:-cube-sandbox-hybrid-jfs}"
+CUBE_HYBRID_REMOTE_DIR="${CUBE_HYBRID_REMOTE_DIR:-/data/cubelet/storage/hybrid/remote}"
+CUBE_HYBRID_LOCAL_DIR="${CUBE_HYBRID_LOCAL_DIR:-/data/cubelet/storage/hybrid/local}"
+CUBE_HYBRID_CACHE_DIR="${CUBE_HYBRID_CACHE_DIR:-/data/cubelet/hybrid-jfs-cache}"
+CUBE_HYBRID_CACHE_SIZE_MB="${CUBE_HYBRID_CACHE_SIZE_MB:-102400}"
+CUBE_HYBRID_MOUNT_OPTS="${CUBE_HYBRID_MOUNT_OPTS:---writeback}"
+CUBE_HYBRID_SOCKET_PATH="${CUBE_HYBRID_SOCKET_PATH:-/run/cubestor.sock}"
+CUBE_HYBRID_CUBESTORCLI_PATH="${CUBE_HYBRID_CUBESTORCLI_PATH:-/usr/local/bin/cubestorcli}"
+CUBE_HYBRID_NBDKIT_PATH="${CUBE_HYBRID_NBDKIT_PATH:-/usr/local/bin/nbdkit}"
+CUBE_HYBRID_CUBESTOR_PLUGIN_PATH="${CUBE_HYBRID_CUBESTOR_PLUGIN_PATH:-/usr/local/lib/cube-sandbox/nbdkit-cubestor-plugin.so}"
+CUBE_HYBRID_BLOCK_SIZE="${CUBE_HYBRID_BLOCK_SIZE:-1M}"
+CUBE_HYBRID_COMPRESS="${CUBE_HYBRID_COMPRESS:-lz4}"
+if [[ "${ONE_CLICK_ENABLE_HYBRID}" == "1" && -z "${CUBE_HYBRID_META_URL}" ]]; then
+  if [[ "${DEPLOY_ROLE}" == "compute" && -n "${ONE_CLICK_CONTROL_PLANE_IP:-}" ]]; then
+    CUBE_HYBRID_META_URL="redis://${ONE_CLICK_CONTROL_PLANE_IP}:6381/0"
+  elif [[ "${DEPLOY_ROLE}" != "compute" && -n "${CUBE_SANDBOX_NODE_IP:-}" ]]; then
+    CUBE_HYBRID_META_URL="redis://${CUBE_SANDBOX_NODE_IP}:6381/0"
+  fi
+fi
+if [[ "${ONE_CLICK_ENABLE_HYBRID}" == "1" && -z "${CUBE_HYBRID_BUCKET}" \
+      && "${DEPLOY_ROLE}" != "compute" && "${CUBE_SANDBOX_MINIO_ENABLED:-0}" == "1" \
+      && -n "${CUBE_S3_ENDPOINT:-}" ]]; then
+  CUBE_HYBRID_BUCKET="${CUBE_S3_ENDPOINT%/}/cube-hybrid"
+fi
+if [[ "${ONE_CLICK_ENABLE_HYBRID}" == "1" && -z "${CUBE_HYBRID_META_URL}" ]]; then
+  die "CUBE_HYBRID_META_URL is required when Hybrid is enabled"
+fi
+if [[ "${ONE_CLICK_ENABLE_HYBRID}" == "1" && -n "${CUBE_HYBRID_META_PASSWORD}" \
+      && "${CUBE_HYBRID_META_URL}" =~ ^[A-Za-z][A-Za-z0-9+.-]*://[^/@]*:[^/@]+@ ]]; then
+  die "do not set both CUBE_HYBRID_META_PASSWORD and a password in CUBE_HYBRID_META_URL"
+fi
+if [[ "${ONE_CLICK_ENABLE_HYBRID}" == "1" && "${DEPLOY_ROLE}" != "compute" \
+      && -z "${CUBE_HYBRID_BUCKET}" ]]; then
+  die "CUBE_HYBRID_BUCKET is required when Hybrid is enabled"
+fi
 RCOW_WAL_MB="${RCOW_WAL_MB:-32768}"
 RCOW_JOURNAL_MB="${RCOW_JOURNAL_MB:-1024}"
 # Chunk cache region on the WAL image. The image is created once, its total
@@ -2214,6 +2270,7 @@ rm -rf \
   "${INSTALL_PREFIX}/cube-agent" \
   "${INSTALL_PREFIX}/cube-egress" \
   "${INSTALL_PREFIX}/cube-lifecycle-manager" \
+  "${INSTALL_PREFIX}/hybrid" \
   "${INSTALL_PREFIX}/scripts" \
   "${INSTALL_PREFIX}/CubeObservability" \
   "${INSTALL_PREFIX}/observability" \
@@ -2238,6 +2295,9 @@ if [[ "${DEPLOY_ROLE}" == "compute" ]]; then
   # the target it replaces is still running.
   copy_dir_contents "${PKG_ROOT}/systemd" "${INSTALL_PREFIX}/systemd"
   copy_dir_contents "${PKG_ROOT}/scripts" "${INSTALL_PREFIX}/scripts"
+  if [[ -d "${PKG_ROOT}/hybrid" ]]; then
+    copy_dir_contents "${PKG_ROOT}/hybrid" "${INSTALL_PREFIX}/hybrid"
+  fi
   if [[ -d "${PKG_ROOT}/observability" ]]; then
     copy_dir_contents "${PKG_ROOT}/observability" "${INSTALL_PREFIX}/observability"
   fi
@@ -2249,6 +2309,42 @@ else
   generate_templatecenter_config
   patch_cubemaster_external_deps
   cp -a "${PKG_ROOT}/." "${INSTALL_PREFIX}/"
+fi
+
+hybrid_payload="${INSTALL_PREFIX}/hybrid"
+# The bundler always ships the Hybrid payload, and the documented post-install
+# workflow flips ONE_CLICK_ENABLE_HYBRID=1 in .one-click.env and then runs
+# scripts/cube-hybrid/{init,mount}.sh, which expect these absolute paths. So
+# stage the binaries whenever the payload is present instead of keying that on
+# the installer-time toggle -- otherwise flipping the switch after install
+# fails with "cubestorcli is not executable: /usr/local/bin/cubestorcli".
+# The toggle keeps its other meanings: enabling the unit at boot and patching
+# Cubelet's [cow.hybrid] config (see scripts/cube-hybrid/mount.sh).
+if [[ -d "${hybrid_payload}" ]]; then
+  ensure_dir "${hybrid_payload}"
+  ensure_file "${hybrid_payload}/bin/cubestorcli"
+  ensure_file "${hybrid_payload}/bin/nbdkit"
+  ensure_file "${hybrid_payload}/lib/nbdkit-cubestor-plugin.so"
+  install -m 0755 "${hybrid_payload}/bin/cubestorcli" /usr/local/bin/cubestorcli
+  install -m 0755 "${hybrid_payload}/bin/nbdkit" /usr/local/bin/nbdkit
+  install -d -m 0755 /usr/local/lib/cube-sandbox
+  install -m 0755 "${hybrid_payload}/lib/nbdkit-cubestor-plugin.so" \
+    /usr/local/lib/cube-sandbox/nbdkit-cubestor-plugin.so
+  rm -f \
+    /usr/local/bin/cubestor \
+    /usr/local/lib/cube-sandbox/nbdkit-overlay-plugin.so
+  for hybrid_binary in \
+    /usr/local/bin/cubestorcli \
+    /usr/local/bin/nbdkit \
+    /usr/local/lib/cube-sandbox/nbdkit-cubestor-plugin.so; do
+    [[ -e "${hybrid_binary}" ]] || die "missing Hybrid artifact: ${hybrid_binary}"
+    if ldd "${hybrid_binary}" 2>&1 | grep -q 'not found'; then
+      ldd "${hybrid_binary}" >&2 || true
+      die "Hybrid artifact has unresolved shared libraries: ${hybrid_binary}"
+    fi
+  done
+elif [[ "${ONE_CLICK_ENABLE_HYBRID}" == "1" ]]; then
+  die "ONE_CLICK_ENABLE_HYBRID=1 but the release bundle has no hybrid payload at ${hybrid_payload}"
 fi
 
 select_installed_kernel_vmlinux
@@ -2271,6 +2367,9 @@ mkdir -p \
   /data/cube-shared \
   /data/cube-shared/volume \
   /data/shared
+if [[ "${ONE_CLICK_ENABLE_HYBRID}" == "1" ]]; then
+  mkdir -p "${CUBE_HYBRID_LOCAL_DIR}"
+fi
 
 # CubeS3lvol (s3lvol): per-machine WAL image. The package never ships it --
 # its size fixes the journal/WAL layout and it must not be copied between
@@ -2461,6 +2560,29 @@ upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_JFS_CACHE_SIZE_MB" "${CUBE_JFS_CACHE_S
 upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_JFS_MOUNT_OPTS" "${CUBE_JFS_MOUNT_OPTS}"
 upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_JFS_BLOCK_SIZE" "${CUBE_JFS_BLOCK_SIZE}"
 upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_JFS_COMPRESS" "${CUBE_JFS_COMPRESS}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "ONE_CLICK_ENABLE_HYBRID" "${ONE_CLICK_ENABLE_HYBRID}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_META_URL" "${CUBE_HYBRID_META_URL}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_META_PASSWORD" "${CUBE_HYBRID_META_PASSWORD}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_VOLUME_NAME" "${CUBE_HYBRID_VOLUME_NAME}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_STORAGE" "${CUBE_HYBRID_STORAGE}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_BUCKET" "${CUBE_HYBRID_BUCKET}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_ACCESS_KEY" "${CUBE_HYBRID_ACCESS_KEY}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_SECRET_KEY" "${CUBE_HYBRID_SECRET_KEY}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_JFS_IMAGE" "${CUBE_HYBRID_JFS_IMAGE}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_JFS_CONTAINER_NAME" "${CUBE_HYBRID_JFS_CONTAINER_NAME}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_REMOTE_DIR" "${CUBE_HYBRID_REMOTE_DIR}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_LOCAL_DIR" "${CUBE_HYBRID_LOCAL_DIR}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_CACHE_DIR" "${CUBE_HYBRID_CACHE_DIR}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_CACHE_SIZE_MB" "${CUBE_HYBRID_CACHE_SIZE_MB}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_MOUNT_OPTS" "${CUBE_HYBRID_MOUNT_OPTS}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_SOCKET_PATH" "${CUBE_HYBRID_SOCKET_PATH}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_CUBESTORCLI_PATH" "${CUBE_HYBRID_CUBESTORCLI_PATH}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_NBDKIT_PATH" "${CUBE_HYBRID_NBDKIT_PATH}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_CUBESTOR_PLUGIN_PATH" "${CUBE_HYBRID_CUBESTOR_PLUGIN_PATH}"
+remove_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_CUBESTOR_PATH"
+remove_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_OVERLAY_PLUGIN_PATH"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_BLOCK_SIZE" "${CUBE_HYBRID_BLOCK_SIZE}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_HYBRID_COMPRESS" "${CUBE_HYBRID_COMPRESS}"
 upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_S3LVOL_BUCKET" "${CUBE_S3LVOL_BUCKET}"
 upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_OPS_S3_BUCKET" "${CUBE_OPS_S3_BUCKET:-cube-ops}"
 upsert_env_kv "${RUNTIME_ENV_FILE}" "CUBE_ARTIFACT_STORE_BACKEND" "${CUBE_ARTIFACT_STORE_BACKEND:-s3}"

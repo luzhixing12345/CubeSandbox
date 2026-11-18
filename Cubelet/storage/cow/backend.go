@@ -17,9 +17,10 @@ import (
 // copy_file_range (a metadata-only clone on JuiceFS) instead of FICLONE.
 // Memory is served by the page cache and the JuiceFS block cache.
 const (
-	BackendXFS = "xfs"
-	BackendS3  = "s3"
-	BackendJFS = "jfs"
+	BackendXFS    = "xfs"
+	BackendS3     = "s3"
+	BackendJFS    = "jfs"
+	BackendHybrid = "hybrid"
 )
 
 // NormalizeBackend maps request/config aliases onto BackendXFS, BackendS3 or
@@ -32,8 +33,11 @@ func NormalizeBackend(raw string) (string, error) {
 		return BackendS3, nil
 	case BackendJFS, "juicefs":
 		return BackendJFS, nil
+	case BackendHybrid, "cubestor":
+		return BackendHybrid, nil
 	default:
-		return "", fmt.Errorf("unsupported cow backend %q (want %q, %q or %q)", raw, BackendXFS, BackendS3, BackendJFS)
+		return "", fmt.Errorf("unsupported cow backend %q (want %q, %q, %q or %q)",
+			raw, BackendXFS, BackendS3, BackendJFS, BackendHybrid)
 	}
 }
 

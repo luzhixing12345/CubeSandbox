@@ -102,6 +102,13 @@ func (h *localCubeRunTemplateManager) ListLocalTemplates(ctx context.Context) (m
 			"err": err.Error(),
 		}).Warn("failed to recover local templates from jfs snapshot root")
 	}
+	// Hybrid keeps its catalog under <work>/hybrid/snapshots, same layout as
+	// xfs/s3, so the generic metadata-home recovery applies.
+	if err := h.recoverBackendMetadataHomes(ctx, cow.BackendHybrid, "cubebox", ""); err != nil {
+		log.G(ctx).WithFields(CubeLog.Fields{
+			"err": err.Error(),
+		}).Warn("failed to recover local templates from hybrid snapshot root")
+	}
 	if err := h.recoverS3LocalTemplates(ctx, ""); err != nil {
 		log.G(ctx).WithFields(CubeLog.Fields{
 			"err": err.Error(),
@@ -232,6 +239,15 @@ func (h *localCubeRunTemplateManager) EnsureCubeRunTemplate(ctx context.Context,
 	case cow.BackendS3:
 		reportRecoveryError(h.recoverS3LocalTemplates(ctx, templateID))
 	case cow.BackendJFS:
+		reportRecoveryError(h.recoverBackendMetadataHomes(ctx, backend, "cubebox", templateID))
+		if cloned, err := h.cloneAndHydrate(templateID); err != nil || cloned != nil {
+			return cloned, err
+		}
+	case cow.BackendHybrid:
+		// Hybrid publishes the same metadata home + catalog layout under
+		// <work>/hybrid, and the rootfs/memory objects are resolved through the
+		// hybrid Store by name, so metadata recovery alone makes the template
+		// runnable on any node that can reach the shared remote directory.
 		reportRecoveryError(h.recoverBackendMetadataHomes(ctx, backend, "cubebox", templateID))
 		if cloned, err := h.cloneAndHydrate(templateID); err != nil || cloned != nil {
 			return cloned, err

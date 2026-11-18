@@ -25,6 +25,11 @@ var (
 	commitMemoryFromBaseFor          = storage.CommitMemoryFromBaseFor
 	createMemoryVolumeFor            = storage.CreateMemoryVolumeFor
 	getImportedSandboxMemoryFor      = storage.GetImportedSandboxMemoryFor
+	// resolveMemoryObjectFromSnapshotFn is the catalog lookup used to find a
+	// template's committed memory image, which doubles as the restore base for
+	// a sandbox started from that template. A var so tests can state the base
+	// without a populated snapshot catalog.
+	resolveMemoryObjectFromSnapshotFn = resolveMemoryObjectFromSnapshotID
 )
 
 // ErrNoBaseMemoryForIncremental is returned when CommitSandbox cannot

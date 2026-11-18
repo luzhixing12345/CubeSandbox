@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
@@ -29,6 +30,28 @@ import (
 )
 
 func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxRequest) (*cubebox.CommitSandboxResponse, error) {
+	commitStart := time.Now()
+	var commitMark = commitStart
+	var stageLogger *log.CubeWrapperLogEntry
+	// Stage timing is opt-in: it exists to localize snapshot latency and would
+	// otherwise append one line per stage on every commit forever.
+	stageTraceFile := strings.TrimSpace(os.Getenv("CUBE_COMMIT_STAGE_TRACE"))
+	stage := func(name string) {
+		now := time.Now()
+		elapsed := now.Sub(commitMark).Milliseconds()
+		total := now.Sub(commitStart).Milliseconds()
+		commitMark = now
+		if stageTraceFile != "" {
+			if f, ferr := os.OpenFile(stageTraceFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); ferr == nil {
+				fmt.Fprintf(f, "%s commit=%s stage=%s stageMs=%d totalMs=%d\n",
+					now.Format("15:04:05.000"), req.GetSandboxID(), name, elapsed, total)
+				f.Close()
+			}
+		}
+		if stageLogger != nil && elapsed >= 500 {
+			stageLogger.Infof("commit stage %s took %dms (total %dms)", name, elapsed, total)
+		}
+	}
 	rsp := &cubebox.CommitSandboxResponse{
 		RequestID:  req.GetRequestID(),
 		SandboxID:  req.GetSandboxID(),
@@ -84,6 +107,8 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		return rsp, nil
 	}
 	stepLog = stepLog.WithFields(CubeLog.Fields{"backend": backend})
+	stageLogger = stepLog
+	stage("resolve-backend")
 
 	unlock := s.sandboxLifecycleLocks.Lock(rsp.SandboxID)
 	defer unlock()
@@ -227,6 +252,7 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		rsp.Ret.RetMsg = fmt.Sprintf("failed to create snapshot dir: %v", layoutErr)
 		return rsp, nil
 	}
+	stage("prepare-payload+layout")
 	// CommitSandbox snapshots a running sandbox whose memory artifact has
 	// just been prepared above. snapshotTypeForCmd carries the right type
 	// for the path we took: soft-dirty when reflink-cloning a base, or full
@@ -297,6 +323,7 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 				frozenCtx, cb, rsp.TemplateID, layout.MetaWork,
 				payload.MemoryDevPath(), snapshotTypeForCmd, sourceRootfs.DevPath, mode,
 			)
+			stage("shim-capture")
 			if captureErr == nil && mode.IsFsOnly() {
 				// A cold boot mounts what the package names, so the package must
 				// name the layer this sandbox actually uses -- see
@@ -321,6 +348,7 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 			return snapshotCaptureError(captureErr)
 		}, func() error {
 			rootfsObject, err = storage.CommitRootfsFor(frozenCtx, backend, sourceRootfs, rsp.TemplateID)
+			stage("commit-rootfs")
 			if err != nil {
 				return err
 			}
@@ -335,7 +363,9 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 			}
 			resumeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotResumeTimeout)
 			defer cancel()
-			return errors.Join(leaseErr, s.resumeSnapshotWithShim(resumeCtx, cb, rsp.TemplateID))
+			err := errors.Join(leaseErr, s.resumeSnapshotWithShim(resumeCtx, cb, rsp.TemplateID))
+			stage("resume")
+			return err
 		})
 		// A shim whose recorded pin is at or above the boundary but which rejects
 		// the action means the version gate guessed wrong about it. The shim
@@ -399,6 +429,7 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		rsp.Ret.RetMsg = fmt.Sprintf("failed to deactivate snapshot objects: %v", err)
 		return rsp, nil
 	}
+	stage("deactivate")
 	if layout.usesTmpRename() {
 		// NOCC:Path Traversal()
 		if err := os.RemoveAll(snapshotPath); err != nil {
@@ -464,13 +495,16 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		// drift between master and cubelet local view.
 		stepLog.Warnf("failed to persist snapshot catalog for %s: %v", rsp.TemplateID, err)
 	}
+	stage("write-catalog")
 	// S3: seal memory／metadata work volumes to RO snapshots, then Upload.
 	if err := storage.FinalizeS3PackageSnapshots(ctx, backend, rsp.TemplateID); err != nil {
 		stepLog.Warnf("failed to seal s3 package snapshots for %s: %v", rsp.TemplateID, err)
 	}
+	stage("finalize-s3")
 	if raw := uploadRemoteUUIDs(ctx, backend, rsp.TemplateID); raw != "" {
 		rsp.RemoteUuids = raw
 	}
+	stage("upload-uuids")
 	// Publish the completed package and component versions together. On a
 	// sync failure the baseline remains invalid, so future commits degrade
 	// safely. The completed snapshot still succeeds and remains managed by
@@ -483,6 +517,7 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		}
 	}
 	stepLog.Infof("CommitSandbox completed successfully: snapshotPath=%s", snapshotPath)
+	stage("persist-binding")
 	return rsp, nil
 }
 
@@ -955,6 +990,9 @@ func finalizeCleanupRefs(backend, templateID string, refs []storage.CowObjectRef
 
 func otherCowBackend(backend string) string {
 	normalized, err := resolveRequestStorageBackend(backend)
+	if err == nil && normalized == cow.BackendHybrid {
+		return cow.BackendHybrid
+	}
 	if err == nil && normalized == cow.BackendS3 {
 		return cow.BackendXFS
 	}

@@ -72,6 +72,7 @@ type local struct {
 	s3CowEngine          *cubecow.Engine
 	cowManager           cowVolumeManager // XFS / xfscow Store (reflink handle)
 	s3CowManager         cowVolumeManager // S3 Store (s3 cubecow handle)
+	hybridManager        cowVolumeManager // cubestor/nbdkit local-XFS overlay Store
 	s3InitCancel         context.CancelFunc
 	jfsInitMu            sync.Mutex // serializes jfs handle initialization and close
 	jfsStateMu           sync.RWMutex
@@ -199,8 +200,7 @@ func (l *local) resetCowNodeStorage() error {
 	// JFS is a cluster-wide namespace. A node reset must never call
 	// reset_node_storage on that handle because it would erase objects owned
 	// by every other node. Normal object lifecycle cleanup is driven by Cube.
-	l.Close()
-	return nil
+	return l.Close()
 }
 
 func (l *local) cleanupCowStateOnDisk() error {
@@ -245,13 +245,11 @@ func (l *local) refreshCowPaths(info *StorageInfo) error {
 		return nil
 	}
 	backend := storageBackendFromInfo(info)
-	if IsS3Backend(backend) {
-		// On S3 a recorded device path is worse than none: s3lvol hands out a
-		// different /dev/nvmeXn1 on every activate, so a stale one points at
-		// another object's disk. Resolving it here is not an option either —
-		// that would activate every volume this node ever recorded, live or
-		// dead, outside any request. Drop it and let the request that needs a
-		// device resolve it (ResolveDevPath always activates on S3).
+	if IsS3Backend(backend) || backend == cow.BackendHybrid {
+		// Dynamically attached backends hand out transient device paths. A
+		// stale /dev/nvmeXn1 or /dev/nbdN can later belong to another object,
+		// and resolving every recorded object here would exhaust devices.
+		// Drop paths and let the live request resolve only what it needs.
 		for _, volume := range info.Volumes {
 			if volume != nil && strings.TrimSpace(volume.VolumeName) != "" {
 				volume.FilePath = ""
@@ -465,6 +463,13 @@ func (l *local) loopUpdateStatus(context context.Context) {
 
 func (l *local) Close() error {
 	l.stopS3CowInitLoop()
+	var closeErr error
+	if hybrid, ok := l.hybridManager.(*HybridStore); ok && hybrid != nil {
+		if err := hybrid.Close(context.Background()); err != nil {
+			closeErr = errors.Join(closeErr, err)
+		}
+	}
+	l.hybridManager = nil
 	if l.cowEngine != nil {
 		l.cowEngine.Close()
 		l.cowEngine = nil
@@ -472,7 +477,7 @@ func (l *local) Close() error {
 	l.clearS3Cow()
 	l.closeJFSCow()
 	l.cowManager = nil
-	return nil
+	return closeErr
 }
 
 func (l *local) initHostInfo() error {
@@ -745,6 +750,13 @@ func (l *local) Init(ctx context.Context, opts *workflow.InitInfo) error {
 		}
 		if err := l.ensureCowManager(); err != nil {
 			return err
+		}
+		if l.config.Cow.Hybrid.Enable {
+			hybrid, err := newHybridStore(l.config)
+			if err != nil {
+				return fmt.Errorf("reinitialize hybrid storage: %w", err)
+			}
+			l.hybridManager = hybrid
 		}
 		l.startS3CowInitLoop(ctx)
 	} else {
@@ -1365,6 +1377,14 @@ func (l *local) storeForBackend(backend string) (cow.Store, error) {
 			return nil, ErrJFSNotConfigured
 		}
 		return nil, ErrJFSNotReady
+	case cow.BackendHybrid:
+		if l.hybridManager != nil {
+			return l.hybridManager, nil
+		}
+		if l.config == nil || !l.config.Cow.Hybrid.Enable {
+			return nil, ErrHybridNotConfigured
+		}
+		return nil, ErrHybridNotReady
 	default:
 		if l.cowManager != nil {
 			return l.cowManager, nil
@@ -1382,6 +1402,14 @@ func (l *local) storeForBackend(backend string) (cow.Store, error) {
 			return nil, ErrS3NotReady
 		}
 		return l.s3CowManager, nil
+	case cow.BackendHybrid:
+		if l.hybridManager == nil {
+			if l.config == nil || !l.config.Cow.Hybrid.Enable {
+				return nil, ErrHybridNotConfigured
+			}
+			return nil, ErrHybridNotReady
+		}
+		return l.hybridManager, nil
 	default:
 		if l.cowManager == nil {
 			return nil, fmt.Errorf("xfs cow store is not initialized")

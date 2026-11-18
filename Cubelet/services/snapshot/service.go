@@ -6,7 +6,6 @@ package snapshot
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
@@ -162,14 +161,5 @@ func unsetStatus(requestID, snapshotID, backend, message string) *api.StatusResp
 }
 
 func normalizeStatusBackend(raw string) (string, error) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "", "xfs", "cow", "cubecow", "reflink", "xfscow":
-		return cow.BackendXFS, nil
-	case "s3":
-		return cow.BackendS3, nil
-	case "jfs", "juicefs":
-		return cow.BackendJFS, nil
-	default:
-		return "", fmt.Errorf("unsupported backend %q (want xfs, s3 or jfs)", raw)
-	}
+	return cow.NormalizeBackend(raw)
 }

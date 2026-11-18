@@ -25,6 +25,7 @@ import (
 const (
 	NameXfsCow = "xfscow"
 	NameS3     = "s3"
+	NameHybrid = "hybrid"
 )
 
 // Object kinds match cubecow volume vs snapshot objects.

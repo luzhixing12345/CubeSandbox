@@ -240,3 +240,73 @@ write_cubelet_jfs_config() {
   mv -f "${tmp}" "${config_path}"
   log "updated Cubelet cow.jfs enable=${enable_toml} at ${mount_path}"
 }
+
+# write_cubelet_hybrid_config CONFIG_PATH LOCAL_DIR SHARED_DIR CLI_PATH SOCKET_PATH [0|1]
+# Keep [cow.hybrid] aligned with the installed layout and the one-click switch.
+# scripts/cube-hybrid/mount.sh flips this too, but a package upgrade replaces
+# config.toml wholesale, so every Cubelet start must re-apply the desired state
+# from .one-click.env exactly like cow.jfs does. An empty SHARED_DIR is left
+# empty on purpose: Cubelet then resolves <data_path>/hybrid/remote itself.
+write_cubelet_hybrid_config() {
+  local config_path="${1:-}"
+  local local_dir="${2:-}"
+  local shared_dir="${3:-}"
+  local cli_path="${4:-}"
+  local socket_path="${5:-}"
+  local flag="${6:-0}"
+  local enable_toml
+  local header='[plugins."io.cubelet.internal.v1.storage".cow.hybrid]'
+  local tmp
+  [[ -f "${config_path}" ]] || die "required file not found: ${config_path}"
+  [[ -n "${local_dir}" && -n "${cli_path}" && -n "${socket_path}" ]] \
+    || die "write_cubelet_hybrid_config requires local_dir, cubestorcli_path and socket_path"
+  case "${flag}" in
+    0) enable_toml=false ;;
+    1) enable_toml=true ;;
+    *) die "write_cubelet_hybrid_config enable must be 0 or 1 (got: '${flag}')" ;;
+  esac
+  for value in "${local_dir}" "${shared_dir}" "${cli_path}" "${socket_path}"; do
+    [[ "${value}" != *$'\n'* && "${value}" != *'"'* ]] \
+      || die "invalid newline or quote in Hybrid path"
+  done
+  grep -Fq "${header}" "${config_path}" \
+    || die "Cubelet config is missing ${header}"
+  tmp="$(mktemp "${config_path}.XXXXXX")"
+  awk -v header="${header}" -v enable_toml="${enable_toml}" \
+    -v local_dir="${local_dir}" -v shared_dir="${shared_dir}" \
+    -v cli_path="${cli_path}" -v socket_path="${socket_path}" '
+  function is_table(line, name, t) {
+    t = line
+    sub(/^[[:space:]]+/, "", t)
+    return t == name
+  }
+  function emit_missing() {
+    if (!seen_enable) print "    enable = " enable_toml
+    if (!seen_cli) print "    cubestorcli_path = \"" cli_path "\""
+    if (!seen_socket) print "    socket_path = \"" socket_path "\""
+    if (!seen_local) print "    local_dir = \"" local_dir "\""
+    if (!seen_shared) print "    shared_dir = \"" shared_dir "\""
+  }
+  is_table($0, header) { in_hybrid = 1; print; next }
+  in_hybrid && /^[[:space:]]*\[/ { emit_missing(); in_hybrid = 0 }
+  in_hybrid && /^[[:space:]]*enable[[:space:]]*=/ {
+    print "    enable = " enable_toml; seen_enable = 1; next
+  }
+  in_hybrid && /^[[:space:]]*cubestorcli_path[[:space:]]*=/ {
+    print "    cubestorcli_path = \"" cli_path "\""; seen_cli = 1; next
+  }
+  in_hybrid && /^[[:space:]]*socket_path[[:space:]]*=/ {
+    print "    socket_path = \"" socket_path "\""; seen_socket = 1; next
+  }
+  in_hybrid && /^[[:space:]]*local_dir[[:space:]]*=/ {
+    print "    local_dir = \"" local_dir "\""; seen_local = 1; next
+  }
+  in_hybrid && /^[[:space:]]*shared_dir[[:space:]]*=/ {
+    print "    shared_dir = \"" shared_dir "\""; seen_shared = 1; next
+  }
+  { print }
+  END { if (in_hybrid) emit_missing() }
+  ' "${config_path}" > "${tmp}"
+  mv -f "${tmp}" "${config_path}"
+  log "updated Cubelet cow.hybrid enable=${enable_toml} local=${local_dir}"
+}

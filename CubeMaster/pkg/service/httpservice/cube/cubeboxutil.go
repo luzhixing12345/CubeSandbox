@@ -1049,8 +1049,9 @@ func bindAppSnapshotTemplateReplica(ctx context.Context, templateID string, reqI
 }
 
 // sharedJFSTemplate reports whether templateReq is an AppSnapshot template
-// stored on jfs: built once on the volume every node mounts. User snapshots
-// keep their own cross-node rules.
+// stored on a backend whose template objects live in the remote tree every
+// node mounts (jfs, hybrid): built once, then readable from any node. User
+// snapshots keep their own cross-node rules.
 func sharedJFSTemplate(templateReq *types.CreateCubeSandboxReq, kind string) bool {
 	if templateReq == nil || strings.EqualFold(kind, templatecenter.TemplateKindSnapshot) {
 		return false
@@ -1059,7 +1060,7 @@ func sharedJFSTemplate(templateReq *types.CreateCubeSandboxReq, kind string) boo
 	if strings.TrimSpace(backend) == "" && templateReq.Annotations != nil {
 		backend = templateReq.Annotations[constants.CubeAnnotationStorageBackend]
 	}
-	return constants.IsJFSBackend(backend)
+	return constants.IsSharedRemoteBackend(backend)
 }
 
 func injectReplicaComponentVersionAnnotations(annotations map[string]string, replica templatecenter.ReplicaStatus) {

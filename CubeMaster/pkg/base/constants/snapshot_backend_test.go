@@ -21,6 +21,8 @@ func TestNormalizeSnapshotBackend(t *testing.T) {
 		{in: "S3", want: SnapshotBackendS3},
 		{in: "jfs", want: SnapshotBackendJFS},
 		{in: "JuiceFS", want: SnapshotBackendJFS},
+		{in: "hybrid", want: SnapshotBackendHybrid},
+		{in: "cubestor", want: SnapshotBackendHybrid},
 		{in: "nfs", wantErr: true},
 	}
 	for _, tc := range cases {
@@ -81,11 +83,16 @@ func TestSnapshotRemoteStatus(t *testing.T) {
 	if got := SnapshotRemoteStatus(SnapshotBackendXFS); got != "" {
 		t.Fatalf("xfs remote_status=%q, want empty", got)
 	}
+	// Hybrid publishes its local overlay into the shared image in the
+	// background, so the row must start pending for the poller to pick it up.
+	if got := SnapshotRemoteStatus(SnapshotBackendHybrid); got != RemoteStatusPending {
+		t.Fatalf("hybrid remote_status=%q, want %q", got, RemoteStatusPending)
+	}
 }
 
 func TestIsRemoteTrackedBackend(t *testing.T) {
 	t.Parallel()
-	for _, b := range []string{"s3", "jfs", "juicefs"} {
+	for _, b := range []string{"s3", "jfs", "juicefs", "hybrid", "cubestor"} {
 		if !IsRemoteTrackedBackend(b) {
 			t.Fatalf("%q must be remote tracked", b)
 		}

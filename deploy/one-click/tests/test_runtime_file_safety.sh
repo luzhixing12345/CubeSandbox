@@ -1173,6 +1173,52 @@ test_mask_external_dep_services_remove_then_mask() {
   assert_contains "${path}" "systemctl daemon-reload"
 }
 
+test_hybrid_release_and_runtime_wiring() {
+  local builder="${ONE_CLICK_DIR}/build-release-bundle-builder.sh"
+  local bundle="${ONE_CLICK_DIR}/build-release-bundle.sh"
+  local install_sh="${ONE_CLICK_DIR}/install.sh"
+  local env_example="${ONE_CLICK_DIR}/env.example"
+  local cubelet_config="${ONE_CLICK_DIR}/scripts/common/cubelet_config.sh"
+  local cubelet_start="${ONE_CLICK_DIR}/scripts/systemd/cubelet-start.sh"
+
+  assert_contains "${builder}" 'build/server/nbdkit'
+  assert_contains "${builder}" 'build/plugins/cubestor/cubestorcli'
+  assert_contains "${builder}" 'nbdkit-cubestor-plugin.so'
+  # A symlinked checkout (e.g. /root/CubeSandbox -> /data/CubeSandbox) must still
+  # resolve the sibling nbdkit repository from the physical parent directory.
+  assert_contains "${builder}" 'cd -P "${ROOT_DIR}" && pwd -P'
+  assert_contains "${bundle}" '"${PACKAGE_ROOT}/hybrid/bin/nbdkit"'
+  assert_contains "${bundle}" '"${PACKAGE_ROOT}/hybrid/bin/cubestorcli"'
+  assert_contains "${bundle}" '"${PACKAGE_ROOT}/scripts/cube-hybrid"'
+  assert_contains "${install_sh}" 'install -m 0755 "${hybrid_payload}/bin/cubestorcli" /usr/local/bin/cubestorcli'
+  assert_contains "${install_sh}" 'install -m 0755 "${hybrid_payload}/bin/nbdkit" /usr/local/bin/nbdkit'
+  # The documented workflow flips ONE_CLICK_ENABLE_HYBRID=1 *after* install, so
+  # the binaries must be staged whenever the payload exists, not only when the
+  # installer-time toggle is already on.
+  assert_contains "${install_sh}" 'if [[ -d "${hybrid_payload}" ]]; then'
+  assert_contains "${install_sh}" 'ONE_CLICK_ENABLE_HYBRID=1 but the release bundle has no hybrid payload'
+  # The remote dir is bind-mounted onto itself, so findmnt -T returns the
+  # underlying XFS mount plus the JuiceFS entries: the readiness probe must
+  # match a line, not compare the whole output.
+  local hybrid_unit="${ONE_CLICK_DIR}/systemd/cube-sandbox-hybrid.service"
+  assert_contains "${hybrid_unit}" 'grep -qx "fuse.juicefs"'
+  assert_not_contains "${hybrid_unit}" 'test "$(findmnt'
+  assert_contains "${ONE_CLICK_DIR}/scripts/one-click/uninstall.sh" '/usr/local/bin/cubestorcli'
+  assert_contains "${env_example}" 'CUBE_JFS_MOUNT_PATH=/data/cubelet/storage/jfs'
+  assert_contains "${env_example}" 'CUBE_HYBRID_LOCAL_DIR=/data/cubelet/storage/hybrid/local'
+  assert_contains "${env_example}" 'CUBE_HYBRID_REMOTE_DIR=/data/cubelet/storage/hybrid/remote'
+  # An upgrade replaces config.toml, so Cubelet's own start path must re-apply
+  # cow.hybrid from .one-click.env; otherwise a working Hybrid backend silently
+  # comes back disabled ("hybrid storage is not configured").
+  assert_contains "${cubelet_config}" 'write_cubelet_hybrid_config()'
+  assert_contains "${cubelet_start}" 'write_cubelet_hybrid_config'
+  assert_contains "${cubelet_start}" '${ONE_CLICK_ENABLE_HYBRID:-0}'
+  # The MinIO unit must create the artifact bucket: no blobstore call site
+  # enables create_bucket, so a missing bucket only surfaces after an ext4 build.
+  assert_contains "${ONE_CLICK_DIR}/scripts/systemd/minio-postcheck.sh" 'mc mb --ignore-existing'
+  assert_contains "${ONE_CLICK_DIR}/scripts/systemd/minio-postcheck.sh" 'CUBE_S3_BUCKET'
+}
+
 test_render_template_replaces_empty_directory
 test_render_template_rejects_non_empty_directory
 test_unit_prepare_hooks_are_wired
@@ -1224,5 +1270,6 @@ test_postcheck_skips_when_external_host_set
 test_webui_postcheck_skips_when_disabled
 test_external_redis_sentinel_wiring
 test_mask_external_dep_services_remove_then_mask
+test_hybrid_release_and_runtime_wiring
 
 echo "runtime file safety tests OK"

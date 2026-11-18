@@ -307,7 +307,9 @@ func (s *service) AppSnapshot(ctx context.Context, req *cubebox.AppSnapshotReque
 		return rsp, nil
 	}
 
-	memoryObject, err = storage.CreateMemoryVolumeFor(ctx, backend, templateID, memorySizeBytes)
+	memoryObject, snapshotType, err := prepareAppSnapshotMemoryArtifact(
+		ctx, stepLog, backend, templateID, memorySizeBytes,
+	)
 	if err != nil {
 		stepLog.Errorf("Failed to create template memory volume: %v", err)
 		cleanupSnapshotObjects()
@@ -328,10 +330,6 @@ func (s *service) AppSnapshot(ctx context.Context, req *cubebox.AppSnapshotReque
 	}
 
 	stepLog.Info("Step 4: Capturing sandbox snapshot through shim...")
-	// AppSnapshot builds a brand-new template from a fresh sandbox: there is
-	// no base memory blob to overlay onto, so we always ask for a full memory
-	// snapshot. Incremental is reserved for CommitSandbox where the running
-	// sandbox is bound to a prior snapshot whose memory file we can clone.
 	frozenCtx, frozenCancel := detachedSnapshotWorkContext(ctx)
 	defer frozenCancel()
 	cb, err := s.cubeboxMgr.cubeboxManger.Get(frozenCtx, sandboxID)
@@ -362,7 +360,7 @@ func (s *service) AppSnapshot(ctx context.Context, req *cubebox.AppSnapshotReque
 	runLegacy := func() (snapshotErr, rootfsErr error) {
 		return runLegacySnapshot(
 			func() error {
-				return s.captureLegacyMemory(frozenCtx, cb, sandboxID, spec, layout.MetaWork, memoryObject.DevPath, snapshotTypeFull)
+				return s.captureLegacyMemory(frozenCtx, cb, sandboxID, spec, layout.MetaWork, memoryObject.DevPath, snapshotType)
 			},
 			func() (err error) {
 				rootfsObject, err = storage.CommitRootfsFromBuildFor(frozenCtx, backend, templateID)
@@ -378,7 +376,7 @@ func (s *service) AppSnapshot(ctx context.Context, req *cubebox.AppSnapshotReque
 			captureStarted = true
 			captureErr := s.captureSnapshotWithShim(
 				frozenCtx, cb, templateID, layout.MetaWork,
-				memoryObject.DevPath, snapshotTypeFull, "", snapshotmode.Full,
+				memoryObject.DevPath, snapshotType, "", snapshotmode.Full,
 			)
 			if shimSnapshotUnsupported(captureErr) {
 				captureStarted = false
@@ -689,6 +687,54 @@ func (s *service) getCubeboxSnapshotSpec(ctx context.Context, sandboxID string) 
 	}
 
 	return result, nil
+}
+
+// prepareAppSnapshotMemoryArtifact returns the memory volume the VMM dumps into
+// and the capture type that matches it. It runs before Step 4 because the volume
+// must exist before the freeze/capture transaction starts.
+//
+// AppSnapshot runs against a temporary sandbox restored FROM the template being
+// rebuilt, so the template's own memory image is the exact pagemap_anon base for
+// this VM: cloning it and asking the runtime for an incremental capture stores
+// only the pages the guest dirtied since that restore. A full capture rewrites
+// every present page, which on the measured 2 GiB / ~322 MiB-resident template
+// cost ~3.6s per snapshot even when the guest never touched memory.
+//
+// Every failure path degrades to the previous behaviour (empty volume + full
+// capture) rather than failing the snapshot: a missing base image is normal for
+// rootfs-only templates and for the first build of a template.
+func prepareAppSnapshotMemoryArtifact(
+	ctx context.Context,
+	stepLog *log.CubeWrapperLogEntry,
+	backend, templateID string,
+	memorySizeBytes uint64,
+) (*storage.CowSnapshotObject, string, error) {
+	if base, err := resolveMemoryObjectFromSnapshotFn(ctx, backend, templateID); err != nil {
+		stepLog.Warnf("app snapshot memory: template memory lookup failed (%v); capturing full", err)
+	} else if base != nil {
+		cloned, cloneErr := commitMemoryFromBaseFor(ctx, backend, base, templateID, memorySizeBytes)
+		switch {
+		case cloneErr == nil:
+			stepLog.Infof("app snapshot memory: cloned template base %s/%s -> %s, snapshot type=%s",
+				base.Name, base.Kind, cloned.Name, snapshotTypeIncremental)
+			return cloned, snapshotTypeIncremental, nil
+		case errors.Is(cloneErr, storage.ErrCowObjectAlreadyExists):
+			// The destination name is taken, so an earlier attempt already
+			// owns it; surface it instead of silently capturing full into a
+			// volume we do not control.
+			return nil, "", cloneErr
+		default:
+			stepLog.Warnf("app snapshot memory: clone of template base %s failed (%v); capturing full", base.Name, cloneErr)
+		}
+	}
+
+	created, createErr := createMemoryVolumeFor(ctx, backend, templateID, memorySizeBytes)
+	if createErr != nil {
+		return nil, "", createErr
+	}
+	stepLog.Infof("app snapshot memory: created empty volume %s/%s, snapshot type=%s",
+		created.Name, created.Kind, snapshotTypeFull)
+	return created, snapshotTypeFull, nil
 }
 
 // snapshotTypeFull asks the VM to capture every memory page

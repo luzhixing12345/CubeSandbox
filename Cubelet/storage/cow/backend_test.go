@@ -22,6 +22,8 @@ func TestNormalizeBackend(t *testing.T) {
 		{"S3", BackendS3, false},
 		{"jfs", BackendJFS, false},
 		{"JuiceFS", BackendJFS, false},
+		{"hybrid", BackendHybrid, false},
+		{"cubestor", BackendHybrid, false},
 		{"cos", "", true},
 	}
 	for _, tc := range cases {

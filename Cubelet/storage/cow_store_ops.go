@@ -33,9 +33,9 @@ func requireCowStore() (cow.Store, error) {
 	return requireCowStoreFor(cow.BackendXFS)
 }
 
-// requireCowStoreFor returns the [cow.Store] for the given backend type
-// (request `type`: xfs｜s3). Empty / unknown aliases are normalized via
-// [cow.NormalizeBackend].
+// requireCowStoreFor returns the [cow.Store] for the given backend type.
+// Only XFS needs the default cubecow manager; independently initialized
+// backends such as S3, JFS and hybrid must not be blocked on that handle.
 func requireCowStoreFor(backend string) (cow.Store, error) {
 	if localStorage == nil {
 		return nil, fmt.Errorf("storage is not initialized")
@@ -43,10 +43,16 @@ func requireCowStoreFor(backend string) (cow.Store, error) {
 	if !localStorage.useCowStorage() {
 		return nil, fmt.Errorf("storage backend is not cubecow")
 	}
-	if err := localStorage.ensureCowManager(); err != nil {
+	normalized, err := cow.NormalizeBackend(backend)
+	if err != nil {
 		return nil, err
 	}
-	store, err := StoreFor(backend)
+	if normalized == cow.BackendXFS {
+		if err := localStorage.ensureCowManager(); err != nil {
+			return nil, err
+		}
+	}
+	store, err := StoreFor(normalized)
 	if err != nil {
 		return nil, err
 	}
@@ -114,6 +120,9 @@ func requireCowUploader(backend string) (cow.Uploader, error) {
 	}
 	if normalized == cow.BackendJFS {
 		return jfsUploader{}, nil
+	}
+	if normalized == cow.BackendHybrid {
+		return hybridUploaderFor()
 	}
 	if normalized != cow.BackendS3 {
 		return noopUploader{}, nil
@@ -454,7 +463,8 @@ func InspectObjectsFor(ctx context.Context, backend string, refs []CowObjectRef)
 		status.Kind = kind
 		info, err := store.GetVolumeInfo(ctx, ref.Name)
 		if err != nil {
-			if isCowSemantic(err, cubecow.SemNotFound) {
+			if errors.Is(err, ErrCowObjectMissing) ||
+				isCowSemantic(err, cubecow.SemNotFound) {
 				statuses = append(statuses, status)
 				continue
 			}

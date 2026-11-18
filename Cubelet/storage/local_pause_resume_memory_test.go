@@ -58,6 +58,7 @@ func TestPauseResumeClonesLiveMemory(t *testing.T) {
 	require.False(t, pauseResumeClonesLiveMemory("cubecow"))
 	require.False(t, pauseResumeClonesLiveMemory(cow.BackendJFS))
 	require.True(t, pauseResumeClonesLiveMemory(cow.BackendS3))
+	require.True(t, pauseResumeClonesLiveMemory(cow.BackendHybrid))
 }
 
 func TestPrefetchRestoreMemoryVolURLS3FailsClosedWithoutSandboxID(t *testing.T) {

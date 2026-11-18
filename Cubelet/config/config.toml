@@ -148,6 +148,20 @@ dynamic_config_path = "/usr/local/services/cubetoolbox/Cubelet/dynamicconf/conf.
     # the --writeback staging area under it.
     # cache_dir = "/data/cubelet/jfs-cache"
 
+    [plugins."io.cubelet.internal.v1.storage".cow.hybrid]
+    # cubestor/nbdkit local-XFS overlay over a shared POSIX directory.
+    # The first implementation is same-node only; enable explicitly after
+    # starting nbdkit with the cubestor plugin on socket_path.
+    enable = false
+    cubestorcli_path = "/usr/local/bin/cubestorcli"
+    socket_path = "/run/cubestor.sock"
+    local_dir = "/data/cubelet/storage/hybrid/local"
+    # Empty uses <data_path>/hybrid/remote. This path is independent of the
+    # existing cow.jfs backend and must itself be a JuiceFS mount rather than
+    # an ordinary directory on the local XFS filesystem.
+    shared_dir = ""
+    command_timeout_ms = 30000
+
     # Only needed when switching back to the legacy ext4 / raw / reflink-pool
     # backend: change storage_backend to the corresponding value (e.g. "ext4")
     # and uncomment the fields below as needed. Under cubecow these fields are ignored.

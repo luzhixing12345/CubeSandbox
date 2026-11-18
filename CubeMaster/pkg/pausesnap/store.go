@@ -202,7 +202,7 @@ func Complete(ctx context.Context, sandboxID, snapshotID, nodeID, nodeIP, instan
 		return err
 	}
 	if constants.IsRemoteTrackedBackend(existing.Backend) {
-		if constants.IsJFSBackend(existing.Backend) {
+		if constants.IsJFSBackend(existing.Backend) || constants.IsHybridBackend(existing.Backend) {
 			updates["export_uuids"] = ""
 			updates["remote_status"] = constants.RemoteStatusInProgress
 		} else if raw := strings.TrimSpace(exportUUIDs); raw != "" {

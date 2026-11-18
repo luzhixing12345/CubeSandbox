@@ -347,7 +347,10 @@ remove_data() {
     /usr/local/bin/cubecli /usr/local/bin/cubevsmapdump \
     /usr/local/bin/cubemastercli /usr/local/bin/cubeopscli \
     /usr/local/bin/cube-jfs-setup.sh /usr/local/bin/cube-jfs-init.sh \
-    /usr/local/bin/cube-jfs-mount.sh /usr/local/bin/cube-jfs-check.sh
+    /usr/local/bin/cube-jfs-mount.sh /usr/local/bin/cube-jfs-check.sh \
+    /usr/local/bin/cubestorcli /usr/local/bin/cubestor /usr/local/bin/nbdkit \
+    /usr/local/lib/cube-sandbox/nbdkit-cubestor-plugin.so \
+    /usr/local/lib/cube-sandbox/nbdkit-overlay-plugin.so
 }
 
 check_failed=0
@@ -447,7 +450,10 @@ check_installation() {
     /usr/local/bin/cube-runtime /usr/local/bin/cubecli /usr/local/bin/cubevsmapdump \
     /usr/local/bin/cubemastercli /usr/local/bin/cubeopscli \
     /usr/local/bin/cube-jfs-setup.sh /usr/local/bin/cube-jfs-init.sh \
-    /usr/local/bin/cube-jfs-mount.sh /usr/local/bin/cube-jfs-check.sh
+    /usr/local/bin/cube-jfs-mount.sh /usr/local/bin/cube-jfs-check.sh \
+    /usr/local/bin/cubestorcli /usr/local/bin/cubestor /usr/local/bin/nbdkit \
+    /usr/local/lib/cube-sandbox/nbdkit-cubestor-plugin.so \
+    /usr/local/lib/cube-sandbox/nbdkit-overlay-plugin.so
 
   if [[ "${check_failed}" -ne 0 ]]; then
     log "check failed: CubeSandbox leftovers were found"

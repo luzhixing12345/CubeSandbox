@@ -464,9 +464,11 @@ func runSnapshotCreateJob(ctx context.Context, jobID, sandboxID, nodeID, nodeIP 
 	exportUUIDs := ""
 	if constants.IsRemoteTrackedBackend(commitBackend) {
 		raw := strings.TrimSpace(commitRsp.GetRemoteUuids())
-		if constants.IsJFSBackend(commitBackend) {
+		if constants.IsJFSBackend(commitBackend) || constants.IsHybridBackend(commitBackend) {
 			// JFS readiness tracks writeback drain, not a set of paths that
 			// another node must import. The shared namespace needs no UUIDs.
+			// Hybrid merges its local overlay into the same shared namespace in
+			// the background, so it settles the same way.
 			snapUpdates["export_uuids"] = ""
 			snapUpdates["remote_status"] = constants.RemoteStatusInProgress
 		} else if raw != "" {
@@ -765,6 +767,40 @@ func runSnapshotRollbackJob(ctx context.Context, jobID, sandboxID, snapshotID, n
 // idempotent only while the row is still DELETED. DELETING still
 // conflicts as in-progress; after physical cleanup the row is gone and
 // DELETE returns not found.
+// ensureSnapshotRemoteSettled refuses to delete a package whose remote publish
+// has not finished yet.
+//
+// Only backends whose delete depends on the shared image are checked: XFS keeps
+// everything locally, and S3 delete removes its own uploaded objects without
+// coordinating with the uploader. For jfs/hybrid the shared image IS the
+// package, so deleting while a merge is still writing would either fail on the
+// local lock or leave a half-published image behind.
+func ensureSnapshotRemoteSettled(rec *models.SnapshotRecord, snapshotID string) error {
+	if rec == nil {
+		return nil
+	}
+	switch {
+	case constants.IsS3Backend(rec.Backend):
+		return nil
+	case !constants.IsRemoteTrackedBackend(rec.Backend):
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(rec.RemoteStatus)) {
+	case "", constants.RemoteStatusReady:
+		// Empty means the row predates remote tracking, or the backend never
+		// published remotely; both are safe to delete.
+		return nil
+	case constants.RemoteStatusFailed:
+		// A failed publish leaves nothing complete in the shared image, so the
+		// local artifacts are all that is left and deleting them is the only
+		// way to clean up.
+		return nil
+	default:
+		return fmt.Errorf("%w: snapshot %s is still publishing to the shared image (remote_status=%s)",
+			ErrTemplateAttemptInProgress, snapshotID, rec.RemoteStatus)
+	}
+}
+
 func DeleteSnapshot(ctx context.Context, requestID, snapshotID, instanceType string) (*sandboxtypes.TemplateImageJobInfo, error) {
 	if !isReady() {
 		return nil, ErrTemplateStoreNotInitialized
@@ -809,6 +845,16 @@ func DeleteSnapshot(ctx context.Context, requestID, snapshotID, instanceType str
 		}
 		if strings.EqualFold(rec.Status, StatusDeleting) {
 			return fmt.Errorf("%w: snapshot %s is already deleting", ErrTemplateAttemptInProgress, snapshotID)
+		}
+		// A shared-remote package (jfs, hybrid) is only deletable once every
+		// volume has reached the shared image. Hybrid publishes asynchronously:
+		// the snapshot RPC returns as soon as its data is durable locally, then a
+		// background merge copies the local overlay into the shared image. The
+		// merge needs an exclusive lock on each local overlay, so deleting
+		// mid-publish either fails with "in use" or, worse, removes a volume the
+		// publisher is halfway through copying.
+		if err := ensureSnapshotRemoteSettled(rec, snapshotID); err != nil {
+			return err
 		}
 		if _, err := getActiveSnapshotJobByResourceID(ctx, snapshotID); err == nil {
 			return fmt.Errorf("%w: snapshot %s already has an active snapshot operation", ErrTemplateAttemptInProgress, snapshotID)

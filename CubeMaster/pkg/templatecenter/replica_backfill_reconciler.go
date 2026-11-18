@@ -125,14 +125,15 @@ func backfillTemplateReplicas(ctx context.Context, def backfillDefinition) error
 	if err := json.Unmarshal([]byte(job.RequestJSON), &req); err != nil {
 		return fmt.Errorf("decode job request snapshot: %w", err)
 	}
-	// A jfs template is one package on the shared volume: nodes never build
-	// their own replica, so replica rows say nothing about ext4 coverage and
-	// nodesWithoutReadyReplica would flag every non-builder node forever.
+	// A shared-remote template (jfs, hybrid) is one package on the volume every
+	// node mounts: non-builder nodes never hold their own replica, so replica
+	// rows say nothing about ext4 coverage and nodesWithoutReadyReplica would
+	// flag every non-builder node forever.
 	// The sweep still warms the ext4 cache for nodes that joined or
 	// recovered after create: create-time distribution recorded an artifact
 	// placement row per node, and only the in-scope nodes without one are
 	// pushed here.
-	if constants.IsJFSBackend(req.Backend) {
+	if constants.IsSharedRemoteBackend(req.Backend) {
 		if strings.TrimSpace(req.WritableLayerSize) == "" {
 			req.WritableLayerSize = artifact.WritableLayerSize
 		}
