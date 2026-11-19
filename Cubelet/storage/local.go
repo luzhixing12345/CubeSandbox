@@ -1036,9 +1036,10 @@ func (l *local) prefetchRestoreMemoryVolURL(ctx context.Context, opts *workflow.
 	backend := createContextStorageBackend(opts)
 	// Cross-node imports a sandbox-private memory volume. XFS template
 	// start / pause resume / FromSnap mmap the original snapshot file
-	// MAP_PRIVATE. Master's Resume CleanupTemplate is a no-op while the
+	// MAP_PRIVATE. Hybrid also reuses the immutable pause memory export.
+	// Master's Resume CleanupTemplate is a no-op while the
 	// live sandbox still holds that pause id; next Pause or Destroy
-	// unlinks the package (CH keeps the fd open). Same-node S3 pause
+	// removes the package after the old VM exits. Same-node S3 pause
 	// resume still clones onto sb-<id>-memory so deactivate of the
 	// package NVMe cannot yank the live disk; the package catalog is
 	// still kept for Snapshot last-restore, like XFS.
@@ -1132,10 +1133,12 @@ type snapshotMemoryResolver interface {
 // pauseResumeClonesLiveMemory is true when same-node pause resume must
 // copy package memory onto a sandbox-private volume before Create
 // returns. XFS and jfs are false: the original snapshot file is the restore
-// image. S3 is true because the live disk is an NVMe lvol.
+// image. Hybrid also shares the immutable package export, whose live restore
+// binding keeps it attached until the next Pause or Destroy. Only S3 clones
+// because its live disk is an NVMe lvol.
 func pauseResumeClonesLiveMemory(backend string) bool {
 	normalized, err := cow.NormalizeBackend(backend)
-	return err == nil && !cow.IsReflinkBackend(normalized)
+	return err == nil && normalized == cow.BackendS3
 }
 
 // pauseResumeMemoryOwnerID is the sandbox that must own a private copy of the

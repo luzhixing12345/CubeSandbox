@@ -21,14 +21,13 @@ import (
 // Hybrid keeps a volume in two layers: the local XFS overlay holds every page
 // the guest wrote, and the shared JuiceFS image holds the baseline those writes
 // were layered on. Merging the two (cubestorcli sync) is what makes the package
-// readable from another node, but it copies the whole local overlay and needs an
-// exclusive lock on it, so it costs seconds and cannot run while the export is
-// attached.
+// readable from another node. Completed immutable exports can remain attached
+// while the publisher persists the local page cache and merges the image.
 //
-// Running it inside the snapshot RPC made publishing 64% of snapshot latency
-// (measured: 1960ms of 3042ms). Instead the snapshot returns as soon as its data
-// is durable locally, and the merge runs here in the background while Master
-// polls UploadStatus through the same remote_status machinery JFS uses.
+// The snapshot RPC returns after local capture. Publishing runs in the
+// background while Master polls UploadStatus. Hybrid's JuiceFS mount must
+// disable writeback: cubestorcli sync fsyncs the shared image before returning,
+// and only then may UploadStatus report that object storage publication is ready.
 type hybridPublisher struct {
 	store *HybridStore
 

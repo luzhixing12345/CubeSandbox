@@ -1200,6 +1200,9 @@ test_hybrid_release_and_runtime_wiring() {
   # The remote dir is bind-mounted onto itself, so findmnt -T returns the
   # underlying XFS mount plus the JuiceFS entries: the readiness probe must
   # match a line, not compare the whole output.
+  assert_contains "${install_sh}" 'CUBE_HYBRID_MOUNT_OPTS="${CUBE_HYBRID_MOUNT_OPTS:---writeback=false}"'
+  assert_contains "${env_example}" 'CUBE_HYBRID_MOUNT_OPTS=--writeback=false'
+  assert_contains "${ONE_CLICK_DIR}/scripts/systemd/cube-hybrid-mount.sh" 'Hybrid requires JuiceFS writeback disabled'
   local hybrid_unit="${ONE_CLICK_DIR}/systemd/cube-sandbox-hybrid.service"
   assert_contains "${hybrid_unit}" 'grep -qx "fuse.juicefs"'
   assert_not_contains "${hybrid_unit}" 'test "$(findmnt'

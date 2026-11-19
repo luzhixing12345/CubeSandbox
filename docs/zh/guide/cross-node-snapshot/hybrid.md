@@ -268,6 +268,10 @@ Hybrid 在运行时快照制作的同步收尾阶段调用
 持久化失败保留 pending 状态，可通过仍活跃的插件重试；删除会清理标记。
 
 保留原 NBD 设备及其页缓存，恢复直接复用，不创建私有内存克隆。
+同节点 Pause/Resume 也走此路径，不再克隆 `sb-<id>-memory`。存活沙箱的暂停包引用
+阻止 Master 的后台 CleanupTemplate 删除该包；下一次 Pause 完成新包捕获并退出旧 VM 后，
+或 Destroy 退出 VM 后，才回收旧暂停包及其内存设备。Guest 使用私有映射，恢复后的
+内存写入不会修改不可变暂停包；S3 的私有内存克隆行为保持不变。
 正常恢复不再 seal；后台在上传前完成第二阶段。若后续快照需要克隆尚未持久化的内存源，
 先完成源的第二阶段，以确保 CLI 看到完整的文件页表。
 恢复不等待远端上传。nbdkit 对 sealed 镜像持共享文件锁，拒绝写入且禁用读取缓存回填。
@@ -301,3 +305,18 @@ attach 的对象使用创建记录跳过设备枚举；开始 attach 后清除�
 总耗时；插件记录锁等待、数据同步、映射写入、header 写入、元数据同步及
 插件总耗时。记录包含实时时间戳，耗时使用单调时钟、单位微秒；插件总耗时
 包含内部子阶段，不能重复相加。此功能默认关闭，诊断后移除环境变量。
+
+### Hybrid JuiceFS 的上传完成语义
+
+Hybrid 专用挂载使用 `CUBE_HYBRID_MOUNT_OPTS=--writeback=false`。Hybrid 已有本地
+XFS 缓存和后台发布器，不再开启 JuiceFS 的第二层异步写缓存。挂载脚本会拒绝启用
+writeback；普通 JFS 后端的配置不受影响。
+
+后台先执行 `flush --sync-page-cache`，再将 rootfs/memory 合并到共享镜像。
+`cubestorcli sync` 完成共享文件 fsync 和原子替换后，Cubelet 才报告 ready；Master
+下一次状态轮询更新 `remote_status`。这不表示 API 返回与 ready 同时发生。
+共享侧 clone 也执行 fsync，关闭 writeback 后这部分前台耗时可能增加。
+
+修改运行中节点的配置需要重挂载，不能只修改 `.one-click.env`。应先停止新调度，
+确认无存活沙箱、无待持久化内存且 JuiceFS staging 已上传完，再停止 Cubelet、
+断开空闲导出、重启 Hybrid 服务及 Cubelet。不要删除 staging 数据。

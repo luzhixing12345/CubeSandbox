@@ -38,36 +38,41 @@ func installCleanupTemplateTestHooks(t *testing.T) {
 }
 
 func TestCleanupTemplateKeepsLivePauseAndHonorLiveFalseDeletes(t *testing.T) {
-	installCleanupTemplateTestHooks(t)
-	snap := "snap-keep-reg-0000000000000001"
-	getLocalSnapshotForFn = func(_ context.Context, _, id string) (*storage.SnapshotCatalogEntry, error) {
-		return &storage.SnapshotCatalogEntry{SnapshotID: id, Kind: storage.CatalogKindPauseSnapshot}, nil
-	}
-	live := newCubeboxWithStatusForTest("sb-live-keep", cubeboxstore.Status{StartedAt: time.Now().UnixNano()})
-	stampPauseSnapshotID(live, snap)
-	live.BindRestoreBase(snap)
-	listCubeboxesForTest = func() []*cubeboxstore.CubeBox { return []*cubeboxstore.CubeBox{live} }
+	for _, backend := range []string{"xfs", "hybrid"} {
+		t.Run(backend, func(t *testing.T) {
+			installCleanupTemplateTestHooks(t)
+			snap := "snap-keep-reg-0000000000000001"
+			getLocalSnapshotForFn = func(_ context.Context, _, id string) (*storage.SnapshotCatalogEntry, error) {
+				return &storage.SnapshotCatalogEntry{SnapshotID: id, Kind: storage.CatalogKindPauseSnapshot}, nil
+			}
+			live := newCubeboxWithStatusForTest("sb-live-keep", cubeboxstore.Status{StartedAt: time.Now().UnixNano()})
+			stampPauseSnapshotID(live, snap)
+			live.BindRestoreBase(snap)
+			listCubeboxesForTest = func() []*cubeboxstore.CubeBox { return []*cubeboxstore.CubeBox{live} }
 
-	deleted := 0
-	cleanupTemplateLocalDataFn = func(context.Context, string, string) error {
-		deleted++
-		return nil
-	}
+			deleted := 0
+			cleanupTemplateLocalDataFn = func(context.Context, string, string) error {
+				deleted++
+				return nil
+			}
 
-	s := &service{}
-	req := &cubebox.CleanupTemplateRequest{
-		TemplateID: snap,
-		Objects:    []*cubebox.CowObjectRef{{Name: "n", Kind: "snapshot", Role: "rootfs"}},
-	}
-	rsp, err := s.cleanupTemplate(context.Background(), req, true)
-	require.NoError(t, err)
-	require.Equal(t, errorcode.ErrorCode_Success, rsp.GetRet().GetRetCode(), rsp.GetRet().GetRetMsg())
-	require.Equal(t, 0, deleted, "Master Resume Cleanup of a live pause package must no-op")
+			s := &service{}
+			req := &cubebox.CleanupTemplateRequest{
+				TemplateID: snap,
+				Backend:    backend,
+				Objects:    []*cubebox.CowObjectRef{{Name: "n", Kind: "snapshot", Role: "rootfs"}},
+			}
+			rsp, err := s.cleanupTemplate(context.Background(), req, true)
+			require.NoError(t, err)
+			require.Equal(t, errorcode.ErrorCode_Success, rsp.GetRet().GetRetCode(), rsp.GetRet().GetRetMsg())
+			require.Equal(t, 0, deleted, "Master Resume Cleanup of a live pause package must no-op")
 
-	rsp, err = s.cleanupTemplate(context.Background(), req, false)
-	require.NoError(t, err)
-	require.Equal(t, errorcode.ErrorCode_Success, rsp.GetRet().GetRetCode(), rsp.GetRet().GetRetMsg())
-	require.Equal(t, 1, deleted, "next Pause / Destroy GC (honorLive=false) must still delete")
+			rsp, err = s.cleanupTemplate(context.Background(), req, false)
+			require.NoError(t, err)
+			require.Equal(t, errorcode.ErrorCode_Success, rsp.GetRet().GetRetCode(), rsp.GetRet().GetRetMsg())
+			require.Equal(t, 1, deleted, "next Pause / Destroy GC (honorLive=false) must still delete")
+		})
+	}
 }
 
 func TestCleanupTemplateForgedPauseLabelDoesNotKeep(t *testing.T) {

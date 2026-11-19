@@ -20,7 +20,9 @@ MOUNT_PATH="${CUBE_HYBRID_REMOTE_DIR:-/data/cubelet/storage/hybrid/remote}"
 LOCAL_DIR="${CUBE_HYBRID_LOCAL_DIR:-/data/cubelet/storage/hybrid/local}"
 CACHE_DIR="${CUBE_HYBRID_CACHE_DIR:-/data/cubelet/hybrid-jfs-cache}"
 CACHE_SIZE_MB="${CUBE_HYBRID_CACHE_SIZE_MB:-102400}"
-EXTRA_OPTS="${CUBE_HYBRID_MOUNT_OPTS:---writeback}"
+# Hybrid publishes asynchronously itself. Shared-image fsync must wait for
+# object storage before Cubelet reports the package ready.
+EXTRA_OPTS="${CUBE_HYBRID_MOUNT_OPTS:---writeback=false}"
 SOCKET_PATH="${CUBE_HYBRID_SOCKET_PATH:-/run/cubestor.sock}"
 NBDKIT_BIN="${CUBE_HYBRID_NBDKIT_PATH:-/usr/local/bin/nbdkit}"
 CUBESTOR_PLUGIN="${CUBE_HYBRID_CUBESTOR_PLUGIN_PATH:-/usr/local/lib/cube-sandbox/nbdkit-cubestor-plugin.so}"
@@ -56,6 +58,13 @@ stop_components() {
 }
 
 do_start() {
+  local option
+  for option in ${EXTRA_OPTS}; do
+    case "${option}" in
+      --writeback=false|--writeback=False|--writeback=FALSE|--writeback=0|--writeback=f|--writeback=F) ;;
+      --writeback|--writeback=*) die "Hybrid requires JuiceFS writeback disabled; set CUBE_HYBRID_MOUNT_OPTS=--writeback=false" ;;
+    esac
+  done
   trap stop_components EXIT INT TERM
   if [[ -z "${CUBE_HYBRID_META_URL:-}" ]]; then
     if [[ "${ONE_CLICK_DEPLOY_ROLE:-control}" == "compute" && -n "${ONE_CLICK_CONTROL_PLANE_IP:-}" ]]; then

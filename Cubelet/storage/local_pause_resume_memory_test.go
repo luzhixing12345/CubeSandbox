@@ -58,7 +58,7 @@ func TestPauseResumeClonesLiveMemory(t *testing.T) {
 	require.False(t, pauseResumeClonesLiveMemory("cubecow"))
 	require.False(t, pauseResumeClonesLiveMemory(cow.BackendJFS))
 	require.True(t, pauseResumeClonesLiveMemory(cow.BackendS3))
-	require.True(t, pauseResumeClonesLiveMemory(cow.BackendHybrid))
+	require.False(t, pauseResumeClonesLiveMemory(cow.BackendHybrid))
 }
 
 func TestPrefetchRestoreMemoryVolURLS3FailsClosedWithoutSandboxID(t *testing.T) {
@@ -171,4 +171,24 @@ func TestPrefetchHybridRuntimeSnapshotPreparesSharedMemory(t *testing.T) {
 	require.Equal(t, "tpl-snap-publishing-memory", hybrid.restored)
 	require.Empty(t, hybrid.cloneMemoryCalls)
 	require.Empty(t, hybrid.resolveCalls)
+}
+
+func TestPrefetchHybridPauseResumeReusesSnapshotMemory(t *testing.T) {
+	cfg := makeTestConfig(t)
+	cfg.StorageBackend = "cubecow"
+	hybrid := &fakeSnapshotMemoryManager{}
+	l := &local{config: cfg, cowManager: &fakeCowVolumeManager{}, hybridManager: hybrid}
+	require.NoError(t, l.init(&plugin.InitContext{Context: context.Background()}))
+	seedTestSnapshotCatalogFor(t, cow.BackendHybrid, "snap-pause1", "tpl-snap-pause1-memory", CowKindSnapshot)
+	url, owned, err := l.prefetchRestoreMemoryVolURL(context.Background(), pauseResumeCreateContext("sb-1", map[string]string{
+		constants.MasterAnnotationPauseSnapshotID:   "snap-pause1",
+		constants.MasterAnnotationRuntimeSnapshotID: "snap-pause1",
+		constants.MasterAnnotationStorageBackend:    cow.BackendHybrid,
+	}))
+	require.NoError(t, err)
+	require.Equal(t, "file:///dev/mapper/published-memory", url)
+	require.Empty(t, owned, "shared pause memory must not be deleted as sandbox-owned memory")
+	require.Equal(t, "tpl-snap-pause1-memory", hybrid.restored)
+	require.Empty(t, hybrid.cloneMemoryCalls)
+	require.Empty(t, hybrid.resolveCalls, "restore must use the immutable snapshot resolver")
 }
