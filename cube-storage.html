@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cube XFS + JFS 分层存储方案</title>
+<style>
+  :root {
+    --bg:#fff; --fg:#09090b; --muted:#71717a; --muted-bg:#f4f4f5;
+    --border:#e4e4e7; --card:#fff; --ring:#a1a1aa; --radius:10px;
+    --c-master:#4f46e5; --c-cube:#7c3aed; --c-vm:#2563eb;
+    --c-nbd:#0284c7; --c-overlay:#16a34a; --c-xfs:#d97706;
+    --c-jfs:#059669; --c-state:#dc2626;
+  }
+  .dark {
+    --bg:#09090b; --fg:#fafafa; --muted:#a1a1aa; --muted-bg:#18181b;
+    --border:#27272a; --card:#09090b; --ring:#52525b;
+    --c-master:#818cf8; --c-cube:#a78bfa; --c-vm:#60a5fa;
+    --c-nbd:#38bdf8; --c-overlay:#4ade80; --c-xfs:#fbbf24;
+    --c-jfs:#34d399; --c-state:#f87171;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Inter,"PingFang SC","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap { max-width:1320px; margin:0 auto; padding:32px 24px 56px; }
+  header { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:20px; }
+  h1 { margin:0 0 5px; font-size:24px; font-weight:600; letter-spacing:-.02em; }
+  .sub { margin:0; color:var(--muted); }
+  .btn {
+    border:1px solid var(--border); background:var(--card); color:var(--fg);
+    height:34px; padding:0 12px; border-radius:8px; font:inherit; font-size:13px;
+    cursor:pointer; white-space:nowrap;
+  }
+  .btn:hover { background:var(--muted-bg); }
+  .bar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:16px; flex-wrap:wrap; }
+  .tabs { display:inline-flex; gap:2px; padding:4px; border-radius:9px; background:var(--muted-bg); }
+  .tab {
+    border:0; background:transparent; color:var(--muted); padding:6px 12px;
+    border-radius:6px; font:inherit; font-size:13px; font-weight:500; cursor:pointer;
+  }
+  .tab.on { background:var(--card); color:var(--fg); box-shadow:0 1px 2px rgba(0,0,0,.08); }
+  .card { border:1px solid var(--border); border-radius:var(--radius); background:var(--card); }
+  .stage { padding:18px 20px; margin-bottom:16px; }
+  .stage h2 { margin:0 0 4px; font-size:16px; font-weight:600; letter-spacing:-.01em; }
+  .desc { margin:0 0 14px; color:var(--muted); font-size:13px; }
+  .view { display:none; }
+  .view.on { display:block; }
+  .flowhead { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
+  .steps { display:flex; flex-wrap:wrap; gap:6px; margin:10px 0 12px; }
+  .pill {
+    border:1px solid var(--border); background:var(--card); color:var(--muted);
+    border-radius:99px; padding:5px 10px; font:inherit; font-size:12px; cursor:pointer;
+  }
+  .pill b { color:var(--fg); margin-right:4px; }
+  .pill.on { background:var(--fg); color:var(--bg); border-color:var(--fg); }
+  .pill.on b { color:var(--bg); }
+  .flowbody { display:block; }
+  .svgbox { position:relative; min-width:0; }
+  .svgbox svg { width:100%; height:auto; display:block; }
+  .info { border-top:1px solid var(--border); margin-top:10px; padding-top:12px; }
+  .info .step-no { color:var(--muted); font-size:12px; }
+  .info h3 { margin:2px 0 8px; font-size:16px; line-height:1.35; }
+  .info .tag { display:inline-block; background:var(--fg); color:var(--bg); border-radius:6px; padding:3px 8px; font-size:12px; font-weight:600; margin-bottom:8px; }
+  .info ul { margin:4px 0 0; padding-left:17px; color:var(--muted); font-size:13px; line-height:1.62; }
+  .info li { margin:6px 0; }
+  code { font:12px ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--muted-bg); padding:1px 5px; border-radius:4px; }
+  .nav { display:flex; align-items:center; gap:8px; }
+  .hint { color:var(--muted); font-size:12px; }
+  .cols { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .mini { padding:16px 18px; }
+  .mini h3 { margin:0 0 7px; font-size:14px; }
+  .mini p, .mini ul { margin:0; color:var(--muted); font-size:13px; }
+  .mini ul { padding-left:18px; }
+  .mini li { margin:5px 0; }
+  .callout { border-left:3px solid var(--c-state); padding:10px 12px; background:color-mix(in srgb,var(--c-state) 6%,var(--card)); border-radius:0 8px 8px 0; margin-top:12px; }
+  .callout b { color:var(--c-state); }
+  .legend { display:flex; flex-wrap:wrap; gap:14px; margin-top:10px; color:var(--muted); font-size:12px; }
+  .legend i { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:5px; background:var(--c); }
+  .state-row { display:flex; align-items:stretch; gap:0; margin:14px 0; }
+  .state { flex:1; min-width:0; border:1px solid var(--border); border-radius:8px; padding:12px 8px; text-align:center; }
+  .state-arrow { flex:0 0 28px; display:flex; align-items:center; justify-content:center; color:var(--muted); }
+  .state b { display:block; font-size:12px; }
+  .state span { display:block; color:var(--muted); font-size:11px; margin-top:3px; line-height:1.35; }
+  .state.hot { border-color:var(--c-xfs); background:color-mix(in srgb,var(--c-xfs) 7%,var(--card)); }
+  .state.ready { border-color:var(--c-jfs); background:color-mix(in srgb,var(--c-jfs) 7%,var(--card)); }
+  .matrix { width:100%; border-collapse:collapse; font-size:13px; }
+  .matrix th,.matrix td { padding:9px 11px; border-bottom:1px solid var(--border); text-align:left; vertical-align:top; }
+  .matrix th { color:var(--muted); font-weight:500; white-space:nowrap; }
+  .matrix tr:last-child td { border-bottom:0; }
+  .matrix-wrap { overflow:auto; }
+  .foot { margin-top:18px; color:var(--muted); font-size:12px; }
+  svg text { font-family:inherit; fill:var(--fg); }
+  svg .frame { fill:color-mix(in srgb,var(--c) 3%,transparent); stroke:color-mix(in srgb,var(--c) 32%,var(--border)); stroke-width:1.4; stroke-dasharray:4 4; }
+  svg .frame-title { fill:color-mix(in srgb,var(--c) 70%,var(--muted)); font-size:12px; font-weight:600; }
+  svg .box .bg { fill:color-mix(in srgb,var(--c) 8%,var(--card)); stroke:color-mix(in srgb,var(--c) 42%,var(--border)); stroke-width:1.4; transition:.25s; }
+  svg .box .bar { fill:var(--c); }
+  svg .title { fill:color-mix(in srgb,var(--c) 58%,var(--fg)); font-size:13px; font-weight:600; }
+  svg .subt { fill:var(--muted); font-size:10.5px; }
+  svg .box.dim { opacity:.14; }
+  svg .box.on .bg { fill:color-mix(in srgb,var(--c) 16%,var(--card)); stroke:var(--c); stroke-width:2.1; }
+  svg .link { fill:none; stroke:color-mix(in srgb,var(--ring) 55%,transparent); stroke-width:1.3; stroke-dasharray:3 4; }
+  svg .arrow { fill:none; stroke:var(--c); stroke-width:2.5; stroke-dasharray:7 6; animation:dash .9s linear infinite; }
+  svg .ahead { fill:var(--c); }
+  svg .alabel rect { fill:var(--c); }
+  svg .alabel text { fill:#fff; font-size:11px; font-weight:600; }
+  .dark svg .alabel text { fill:#09090b; }
+  @keyframes dash { to { stroke-dashoffset:-26; } }
+  @media (max-width:900px) {
+    .flowbody { grid-template-columns:1fr; min-height:0; }
+    .info { border-left:0; border-top:1px solid var(--border); padding:14px 0 0; }
+    .cols { grid-template-columns:1fr; }
+  }
+  @media (max-width:680px) {
+    .wrap { padding:22px 14px 40px; }
+    .state-row { flex-direction:column; }
+    .state-arrow { flex-basis:22px; transform:rotate(90deg); }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Cube XFS + JFS 分层存储方案</h1>
+      <p class="sub">nbdkit 提供统一块设备视图，XFS 承担运行时热路径，JFS 保存共享、可恢复的远端 generation</p>
+    </div>
+    <button class="btn" id="theme">深色</button>
+  </header>
+
+  <div class="bar">
+    <div class="tabs" id="main-tabs">
+      <button class="tab on" data-view="arch">总体架构</button>
+      <button class="tab" data-view="path">数据路径</button>
+      <button class="tab" data-view="flow">流程设计</button>
+      <button class="tab" data-view="state">一致性与状态</button>
+    </div>
+  </div>
+
+  <section class="view on" id="view-arch">
+    <div class="card stage">
+      <div class="flowhead">
+        <div>
+          <h2>前端、数据面与后端</h2>
+          <p class="desc">Cube 只接触临时 NBD 设备；卷身份由 volume ID、generation 和 manifest 决定，不把 /dev/nbdX 写入持久元数据。</p>
+        </div>
+      </div>
+      <div class="svgbox" id="arch-svg"></div>
+      <div class="legend">
+        <span><i style="--c:var(--c-vm)"></i>VMM 前端</span>
+        <span><i style="--c:var(--c-nbd)"></i>NBD 接口</span>
+        <span><i style="--c:var(--c-overlay)"></i>nbdkit 数据面</span>
+        <span><i style="--c:var(--c-xfs)"></i>本地 XFS</span>
+        <span><i style="--c:var(--c-jfs)"></i>共享 JFS</span>
+      </div>
+    </div>
+    <div class="cols">
+      <div class="card mini">
+        <h3>前端：Cube / Hypervisor</h3>
+        <ul>
+          <li>Cubelet 调用 cubestor 管理 export、NBD 设备和 generation。</li>
+          <li>rootfs 作为 virtio-blk 后端；memory 作为 <code>MAP_PRIVATE</code> backing。</li>
+          <li>CubeMaster 管理调度、LOCAL_READY / REMOTE_READY 和跨机门禁。</li>
+        </ul>
+      </div>
+      <div class="card mini">
+        <h3>后端：local overlay + shared baseline</h3>
+        <ul>
+          <li>XFS local 保存 clean read cache 和尚未发布的 dirty overlay。</li>
+          <li>JFS shared 保存不可变 baseline、manifest 和远端已提交 generation。</li>
+          <li>nbdkit 按 4 KiB 页查 local map，miss 回源 JFS 并回填 XFS。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="view" id="view-path">
+    <div class="card stage">
+      <div class="flowhead">
+        <div>
+          <h2>运行时数据路径</h2>
+          <p class="desc">memory 和 rootfs 的读路径相同，但运行期写语义不同。切换标签查看。</p>
+        </div>
+        <div class="tabs" id="path-tabs">
+          <button class="tab on" data-path="read">读取</button>
+          <button class="tab" data-path="rootwrite">rootfs 写</button>
+          <button class="tab" data-path="memwrite">memory 写</button>
+        </div>
+      </div>
+      <div class="svgbox" id="path-svg"></div>
+      <div id="path-note" class="callout"></div>
+    </div>
+    <div class="cols">
+      <div class="card mini">
+        <h3>页状态</h3>
+        <ul>
+          <li><code>ABSENT</code>：本地没有，读取 shared。</li>
+          <li><code>ZERO</code>：逻辑零页，不访问 shared。</li>
+          <li><code>FROM_SHARED</code>：从 JFS 回填的 clean cache。</li>
+          <li><code>LOCAL</code>：客户端修改的 dirty 数据，发布前不可淘汰。</li>
+        </ul>
+      </div>
+      <div class="card mini">
+        <h3>缓存层次</h3>
+        <p>NBD page cache、nbdkit 本地文件 page cache 和 JuiceFS cache 可能同时存在。上线前要用实际 workload 评估重复缓存、readahead 和内存压力。</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="view" id="view-flow">
+    <div class="card stage">
+      <div class="flowhead">
+        <div class="tabs" id="scenario-tabs"></div>
+        <div class="nav">
+          <span class="hint">← / → 切换</span>
+          <button class="btn" id="prev">上一步</button>
+          <button class="btn" id="next">下一步</button>
+        </div>
+      </div>
+      <div class="steps" id="steps"></div>
+      <div class="flowbody">
+        <div class="svgbox" id="flow-svg"></div>
+        <aside class="info" id="flow-info"></aside>
+      </div>
+    </div>
+  </section>
+
+  <section class="view" id="view-state">
+    <div class="card stage">
+      <h2>generation 状态机</h2>
+      <p class="desc">API 返回和跨节点恢复必须使用不同的提交点。READY 状态只允许单向推进。</p>
+      <div class="state-row">
+        <div class="state"><b>CREATING</b><span>创建 local/shared pair</span></div>
+        <div class="state-arrow">→</div>
+        <div class="state hot"><b>ACTIVE_LOCAL</b><span>持有 writer lease</span></div>
+        <div class="state-arrow">→</div>
+        <div class="state hot"><b>SEALED_LOCAL</b><span>本机可恢复</span></div>
+        <div class="state-arrow">→</div>
+        <div class="state"><b>PUBLISHING</b><span>后台上传与校验</span></div>
+        <div class="state-arrow">→</div>
+        <div class="state ready"><b>READY_REMOTE</b><span>允许跨节点恢复</span></div>
+      </div>
+      <div class="callout"><b>关键规则：</b>clean cache 可以删除；未发布 dirty overlay 是唯一数据副本，必须 pin。节点故障零丢失只有在 REMOTE_READY 后才能保证。</div>
+    </div>
+    <div class="card stage">
+      <h2>一致性边界</h2>
+      <div class="matrix-wrap">
+        <table class="matrix">
+          <thead><tr><th>动作</th><th>必须保证</th><th>完成后的能力</th></tr></thead>
+          <tbody>
+            <tr><td>NBD WRITE</td><td>写入 local page cache；按约定可尚未落盘</td><td>当前进程继续运行</td></tr>
+            <tr><td>FLUSH / FUA</td><td>data → map → header 按序持久化，目录元数据可恢复</td><td>节点重启后恢复 local generation</td></tr>
+            <tr><td>LOCAL_READY</td><td>rootfs、memory、VM state、manifest 均 sealed</td><td>源节点恢复；API 可以返回</td></tr>
+            <tr><td>REMOTE_READY</td><td>远端对象校验完成并发布 commit marker</td><td>跨节点恢复</td></tr>
+            <tr><td>GC</td><td>无 active lease、mmap pin、上传任务和后代引用</td><td>删除 local cache 或 remote generation</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="cols">
+      <div class="card mini">
+        <h3>现有原型必须补齐</h3>
+        <ul>
+          <li>新增 raw rootfs/memory → NBDOVL01 的 import。</li>
+          <li>已有块原地覆盖改为 COW 或 WAL。</li>
+          <li>sync 从重建整个 shared 文件改为 immutable generation 发布。</li>
+          <li>clone 源增加 freeze/lease，map/data 增加校验。</li>
+        </ul>
+      </div>
+      <div class="card mini">
+        <h3>memory 上线门槛</h3>
+        <ul>
+          <li>验证 <code>/dev/nbdX + MAP_PRIVATE</code> 缺页和 readahead。</li>
+          <li>验证 nbdkit 重启、NBD timeout、断链后的 EIO/SIGBUS。</li>
+          <li>验证大内存 flat map 占用和 page-fault p99/p999。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <p class="foot">设计原则：远端 generation 不可变；本地 clean cache 可丢；dirty overlay 在远端提交前不可丢；NBD 设备号不是持久身份。</p>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => [...document.querySelectorAll(s)];
+const esc = (s) => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;");
+
+$("#theme").onclick = () => {
+  document.documentElement.classList.toggle("dark");
+  $("#theme").textContent = document.documentElement.classList.contains("dark") ? "浅色" : "深色";
+};
+
+$("#main-tabs").onclick = (e) => {
+  const b = e.target.closest("[data-view]"); if (!b) return;
+  $$("#main-tabs .tab").forEach(x => x.classList.toggle("on", x === b));
+  $$(".view").forEach(x => x.classList.toggle("on", x.id === "view-" + b.dataset.view));
+};
+
+const color = {
+  master:"var(--c-master)", cube:"var(--c-cube)", vm:"var(--c-vm)",
+  nbd:"var(--c-nbd)", overlay:"var(--c-overlay)", xfs:"var(--c-xfs)",
+  jfs:"var(--c-jfs)", state:"var(--c-state)"
+};
+function frame(x,y,w,h,title,c) {
+  return `<g style="--c:${color[c]}"><rect class="frame" x="${x}" y="${y}" width="${w}" height="${h}" rx="12"/><text class="frame-title" x="${x+14}" y="${y+20}">${esc(title)}</text></g>`;
+}
+function box(b, cls="") {
+  const title = b.t, sub = b.s || "";
+  const cy = b.y + (sub ? b.h/2 - 2 : b.h/2 + 4);
+  return `<g class="box ${cls}" style="--c:${color[b.c]}"><rect class="bg" x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" rx="8"/><rect class="bar" x="${b.x+8}" y="${b.y+12}" width="4" height="${Math.max(18,b.h-24)}" rx="2"/><text class="title" x="${b.x+b.w/2+4}" y="${cy}" text-anchor="middle">${esc(title)}</text>${sub?`<text class="subt" x="${b.x+b.w/2+4}" y="${cy+17}" text-anchor="middle">${esc(sub)}</text>`:""}</g>`;
+}
+function anchor(node, side, f=0.5) {
+  if (side==="t") return [node.x+node.w*f, node.y];
+  if (side==="b") return [node.x+node.w*f, node.y+node.h];
+  if (side==="l") return [node.x, node.y+node.h*f];
+  return [node.x+node.w, node.y+node.h*f];
+}
+function heading(x1,y1,x2,y2) {
+  return Math.abs(x2-x1) >= Math.abs(y2-y1) ? (x2>=x1?"r":"l") : (y2>=y1?"d":"u");
+}
+function head(x,y,dir) {
+  const v={r:[1,0],l:[-1,0],d:[0,1],u:[0,-1]}[dir];
+  const px=-v[1], py=v[0];
+  const bx=x-v[0]*11, by=y-v[1]*11;
+  return `<path class="ahead" d="M${x},${y} L${bx+px*4.5},${by+py*4.5} L${bx-px*4.5},${by-py*4.5} Z"/>`;
+}
+function labelWidth(text) {
+  return [...text].reduce((n,ch)=>n+(ch.charCodeAt(0)>255?12.4:6.8),0)+14;
+}
+function labelRect(text,x,y) {
+  const w=labelWidth(text);
+  return {x:x-w/2,y:y-10,w,h:20,cx:x,cy:y};
+}
+function hits(r,b,pad=2) {
+  return r.x<b.x+b.w+pad && r.x+r.w>b.x-pad && r.y<b.y+b.h+pad && r.y+r.h>b.y-pad;
+}
+function segHits(x1,y1,x2,y2,b) {
+  const L=b.x+4,T=b.y+4,R=b.x+b.w-4,B=b.y+b.h-4;
+  if (R<=L||B<=T) return false;
+  const dx=x2-x1, dy=y2-y1, p=[-dx,dx,-dy,dy], q=[x1-L,R-x1,y1-T,B-y1];
+  let u1=0,u2=1;
+  for (let i=0;i<4;i++) {
+    if (p[i]===0) { if (q[i]<0) return false; continue; }
+    const t=q[i]/p[i];
+    if (p[i]<0) { if (t>u2) return false; if (t>u1) u1=t; }
+    else { if (t<u1) return false; if (t<u2) u2=t; }
+  }
+  return u1<u2;
+}
+function routeHits(pts, nodes, skip) {
+  for (let i=1;i<pts.length;i++) for (const [id,b] of Object.entries(nodes)) {
+    if (skip.has(id)) continue;
+    if (segHits(pts[i-1][0],pts[i-1][1],pts[i][0],pts[i][1],b)) return id;
+  }
+  return "";
+}
+function route(nodes, a, sa, b, sb) {
+  const A=nodes[a], B=nodes[b];
+  let p=[anchor(A,sa), anchor(B,sb)];
+  // Snap near-aligned anchors so short arrows do not grow a 3-5px dogleg.
+  if (Math.abs(p[0][0]-p[1][0])<10) p[0][0]=p[1][0];
+  else if (Math.abs(p[0][1]-p[1][1])<10) p[0][1]=p[1][1];
+  const skip=new Set([a,b]);
+  if (Math.abs(p[0][0]-p[1][0])<2 || Math.abs(p[0][1]-p[1][1])<2) return p;
+  const elbow1=[p[0],[p[1][0],p[0][1]],p[1]];
+  const elbow2=[p[0],[p[0][0],p[1][1]],p[1]];
+  if (!routeHits(elbow1,nodes,skip)) return elbow1;
+  if (!routeHits(elbow2,nodes,skip)) return elbow2;
+  const y=Math.min(A.y,B.y)-28;
+  const around=[[p[0][0],p[0][1]],[p[0][0],y],[p[1][0],y],[p[1][0],p[1][1]]];
+  if (!routeHits(around,nodes,skip)) return around;
+  return elbow1;
+}
+function drawArrow(nodes, spec, taken, bounds={w:1180,h:360}) {
+  const [a,sa,b,sb,label]=spec;
+  const pts=route(nodes,a,sa,b,sb);
+  const d=pts.map((p,i)=>`${i?"L":"M"}${p[0]},${p[1]}`).join(" ");
+  const end=pts[pts.length-1], prev=pts[pts.length-2];
+  const dir=heading(prev[0],prev[1],end[0],end[1]);
+  const tone=color[nodes[b].c];
+  if (!label) return `<g style="--c:${tone}"><path class="arrow" d="${d}"/>${head(end[0],end[1],dir)}</g>`;
+  let longest=[pts[0],pts[1],0];
+  for (let i=1;i<pts.length;i++) {
+    const len=Math.hypot(pts[i][0]-pts[i-1][0], pts[i][1]-pts[i-1][1]);
+    if (len>longest[2]) longest=[pts[i-1],pts[i],len];
+  }
+  const vertical=Math.abs(longest[1][0]-longest[0][0])<2;
+  const mx=(longest[0][0]+longest[1][0])/2, my=(longest[0][1]+longest[1][1])/2;
+  const w=labelWidth(label);
+  const all=Object.values(nodes);
+  const free=(cx,cy)=> {
+    const rect=labelRect(label,cx,cy);
+    if (cx-w/2<6 || cx+w/2>bounds.w-6 || cy-10<6 || cy+10>bounds.h-6) return false;
+    if (all.some(n=>hits(rect,n,4))) return false;
+    if (taken.some(r=>hits(rect,r,5))) return false;
+    return true;
+  };
+  const spots=vertical
+    ? [[mx+12+w/2,my],[mx-12-w/2,my],[mx+12+w/2,my-26],[mx-12-w/2,my+26]]
+    : [[mx,my-15],[mx,my+15],[mx-w/2-12,my-15],[mx+w/2+12,my-15]];
+  let pick=spots.find(([x,y])=>free(x,y));
+  if (!pick) {
+    for (let r=30;r<=80 && !pick;r+=22) {
+      for (const [dx,dy] of [[0,-r],[0,r],[-r,0],[r,0],[-r,-r],[r,r],[-r,r],[r,-r]]) {
+        if (free(mx+dx,my+dy)) { pick=[mx+dx,my+dy]; break; }
+      }
+    }
+  }
+  const chosen=pick||spots[0];
+  const placed=labelRect(label,chosen[0],chosen[1]);
+  taken.push(placed);
+  return `<g style="--c:${tone}"><path class="arrow" d="${d}"/>${head(end[0],end[1],dir)}<g class="alabel"><rect x="${placed.x}" y="${placed.y}" width="${placed.w}" height="${placed.h}" rx="5"/><text x="${placed.cx}" y="${placed.cy+4}" text-anchor="middle">${esc(label)}</text></g></g>`;
+}
+
+const archNodes = {
+  master:{x:18,y:62,w:176,h:66,t:"CubeMaster",s:"调度与状态",c:"master"},
+  manifest:{x:18,y:188,w:176,h:66,t:"Manifest",s:"generation",c:"state"},
+  jfs:{x:18,y:392,w:176,h:108,t:"共享 JFS",s:"远端 baseline",c:"jfs"},
+  Acl:{x:286,y:58,w:176,h:66,t:"Cubelet A",s:"编排",c:"cube"},
+  Acub:{x:532,y:58,w:176,h:66,t:"cubestor",s:"卷管理",c:"cube"},
+  Avm:{x:286,y:188,w:176,h:66,t:"Hypervisor",s:"guest VM",c:"vm"},
+  Anbd:{x:532,y:188,w:176,h:66,t:"NBD",s:"/dev/nbdX",c:"nbd"},
+  Ank:{x:778,y:188,w:176,h:66,t:"nbdkit",s:"overlay",c:"overlay"},
+  Axfs:{x:1024,y:188,w:176,h:66,t:"XFS local",s:"热数据",c:"xfs"},
+  Bcl:{x:286,y:408,w:176,h:66,t:"Cubelet B",s:"目标节点",c:"cube"},
+  Bvm:{x:532,y:408,w:176,h:66,t:"Hypervisor",s:"恢复 VM",c:"vm"},
+  Bnbd:{x:778,y:408,w:176,h:66,t:"NBD",s:"新设备",c:"nbd"},
+  Bxfs:{x:1024,y:408,w:176,h:66,t:"XFS local",s:"空缓存",c:"xfs"}
+};
+const archArrows = [
+  ["master","r","Acl","l","调度"],
+  ["Acl","r","Acub","l","调用"],
+  ["Acl","b","Avm","t","启动"],
+  ["Acub","b","Anbd","t","管理"],
+  ["Avm","r","Anbd","l","块设备"],
+  ["Anbd","r","Ank","l","NBD"],
+  ["Ank","r","Axfs","l","本地读写"],
+  ["jfs","r","Bcl","l","跨机读取"],
+  ["Bcl","r","Bvm","l","恢复"],
+  ["Bvm","r","Bnbd","l","映射"],
+  ["Bnbd","r","Bxfs","l","回填"]
+];
+function renderArch() {
+  const taken=[];
+  let s=`<svg viewBox="0 0 1224 530" xmlns="http://www.w3.org/2000/svg">`;
+  s+=frame(8,24,206,500,"控制面","master");
+  s+=frame(246,24,974,258,"计算节点 A","xfs");
+  s+=frame(246,360,974,140,"计算节点 B","nbd");
+  Object.values(archNodes).forEach(b=>s+=box(b));
+  for(const a of archArrows) s+=drawArrow(archNodes,a,taken,{w:1224,h:530});
+  $("#arch-svg").innerHTML=s+"</svg>";
+}
+renderArch();
+
+const pathNodes = {
+  vm:{x:24,y:40,w:180,h:68,t:"Hypervisor",s:"guest",c:"vm"},
+  nbd:{x:270,y:40,w:160,h:68,t:"/dev/nbdX",s:"页缓存",c:"nbd"},
+  kit:{x:496,y:40,w:160,h:68,t:"nbdkit",s:"overlay",c:"overlay"},
+  map:{x:722,y:40,w:170,h:68,t:"Page Map",s:"页状态",c:"overlay"},
+  xfs:{x:958,y:196,w:180,h:68,t:"本地 XFS",s:"cache + dirty",c:"xfs"},
+  jfs:{x:722,y:196,w:170,h:68,t:"共享 JFS",s:"baseline",c:"jfs"},
+  anon:{x:24,y:196,w:180,h:68,t:"匿名内存",s:"MAP_PRIVATE",c:"vm"},
+  dirty:{x:270,y:196,w:160,h:68,t:"脏页跟踪",s:"anon 页",c:"state"}
+};
+const pathModes = {
+  read:{
+    note:"<b>读缓存：</b>回源页写入 XFS 并标记 FROM_SHARED。后续即使 NBD page cache 被回收，也可以从 XFS 命中。",
+    on:["vm","nbd","kit","map","xfs","jfs"],
+    arrows:[["vm","r","nbd","l","缺页"],["nbd","r","kit","l","读请求"],["kit","r","map","l","查页"],["map","r","xfs","l","命中"],["map","b","jfs","t","未命中"],["jfs","r","xfs","l","回填"]]
+  },
+  rootwrite:{
+    note:"<b>dirty 不是缓存：</b>在 REMOTE_READY 之前，XFS 是这些修改的唯一副本，不能按缓存淘汰。",
+    on:["vm","nbd","kit","map","jfs","xfs"],
+    arrows:[["vm","r","nbd","l","写请求"],["nbd","r","kit","l","NBD"],["kit","r","map","l","分配页"],["map","r","xfs","l","写 XFS"]]
+  },
+  memwrite:{
+    note:"<b>关键区别：</b>运行期 guest 内存写进入匿名 CoW 页，不写 NBD 或 XFS。快照时才把脏页写入新的 snapshot 卷。",
+    on:["vm","anon","dirty"],
+    arrows:[["vm","b","anon","t","CoW"],["anon","r","dirty","l","记录脏页"]]
+  }
+};
+function renderPath(mode) {
+  const m=pathModes[mode], taken=[];
+  let s=`<svg viewBox="0 0 1162 290" xmlns="http://www.w3.org/2000/svg">`;
+  for (const [id,b] of Object.entries(pathNodes)) s+=box(b,m.on.includes(id)?"on":"dim");
+  m.arrows.forEach(a=>s+=drawArrow(pathNodes,a,taken,{w:1162,h:290}));
+  $("#path-svg").innerHTML=s+"</svg>";
+  $("#path-note").innerHTML=m.note;
+}
+$("#path-tabs").onclick=e=>{
+  const b=e.target.closest("[data-path]"); if(!b)return;
+  $$("#path-tabs .tab").forEach(x=>x.classList.toggle("on",x===b));
+  renderPath(b.dataset.path);
+};
+renderPath("read");
+
+function escapesBox(p1, sa, p2) {
+  // Reject an anchor whose first segment points back into its own box.
+  if (sa === "l") return p2[0] <= p1[0];
+  if (sa === "r") return p2[0] >= p1[0];
+  if (sa === "t") return p2[1] <= p1[1];
+  return p2[1] >= p1[1];
+}
+function bestSides(nodes, a, b, label) {
+  const sides=["t","b","l","r"];
+  let best=null;
+  for (const sa of sides) for (const sb of sides) {
+    const A=nodes[a], B=nodes[b];
+    const p1=anchor(A,sa), p2=anchor(B,sb);
+    const pts=[p1,[p2[0],p1[1]],p2];
+    const same = Math.abs(p1[0]-p2[0])<2 || Math.abs(p1[1]-p2[1])<2;
+    const path=same?[p1,p2]:pts;
+    if (!escapesBox(p1,sa,p2)) continue;
+    if (routeHits(path,nodes,new Set([a,b]))) continue;
+    const len=Math.abs(p1[0]-p2[0])+Math.abs(p1[1]-p2[1]);
+    const score=len + (same?0:40) + (sa==="t"||sa==="b"?0:10) + (sb==="t"||sb==="b"?0:10);
+    if (!best || score<best.score) best={sa,sb,score};
+  }
+  if (!best) best={sa:"r",sb:"l"};
+  return [a,best.sa,b,best.sb,label];
+}
+
+const flowNodes = {
+  Avm:{x:34,y:70,w:164,h:62,t:"Hypervisor",s:"guest VM",c:"vm"},
+  Anbd:{x:220,y:70,w:164,h:62,t:"NBD",s:"/dev/nbdX",c:"nbd"},
+  Ank:{x:406,y:70,w:164,h:62,t:"nbdkit",s:"overlay",c:"overlay"},
+  Axfs:{x:592,y:70,w:164,h:62,t:"XFS local",s:"cache + dirty",c:"xfs"},
+  Acl:{x:34,y:170,w:164,h:62,t:"Cubelet A",s:"编排",c:"cube"},
+  Acub:{x:220,y:170,w:164,h:62,t:"cubestor",s:"卷管理",c:"cube"},
+  Bvm:{x:840,y:70,w:160,h:62,t:"Hypervisor",s:"恢复",c:"vm"},
+  Bnbd:{x:1012,y:70,w:160,h:62,t:"NBD",s:"新设备",c:"nbd"},
+  Bcl:{x:840,y:170,w:160,h:62,t:"Cubelet B",s:"目标节点",c:"cube"},
+  Bxfs:{x:1012,y:170,w:160,h:62,t:"XFS local",s:"空缓存",c:"xfs"},
+  master:{x:34,y:336,w:190,h:62,t:"CubeMaster",s:"调度 · 状态",c:"master"},
+  manifest:{x:246,y:336,w:200,h:62,t:"Manifest",s:"generation · commit",c:"state"},
+  jfs:{x:470,y:318,w:680,h:98,t:"共享 JFS",s:"immutable baseline · READY_REMOTE",c:"jfs"}
+};
+const flowEdges = [
+  ["master","Acl"],["manifest","Acub"],["jfs","Ank"],["jfs","Bcl"],
+  ["Acl","Acub"],["Acub","Anbd"],["Avm","Anbd"],["Anbd","Ank"],
+  ["Ank","Axfs"],["Bcl","Bvm"],["Bvm","Bnbd"],["Bnbd","Bxfs"]
+];
+const scenarios = [
+  {name:"制作模板",steps:[
+    {k:"构建 raw 文件",tag:"Cube AppSnapshot",on:["master","Acl","Avm"],a:[["master","Acl","创建临时沙箱"],["Acl","Avm","写 rootfs / memory"]],d:["TemplateCenter 与现有 AppSnapshot 流程保持不变，先得到 raw rootfs 和完整 memory 文件。","这一阶段还不是 overlay 格式，不能直接交给 nbdkit。"]},
+    {k:"导入 shared",tag:"cubestor import",on:["Acl","Acub","Anbd","Axfs","jfs"],a:[["Acl","Acub","import"],["Acub","Anbd","准备 export"],["Anbd","Ank","连接"],["Ank","Axfs","写本地"],["jfs","Ank","共享基线"]],d:["新增 cubestor import，把 raw 文件转换成 NBDOVL01 header、page map 和 packed data blocks。","写入 JFS 临时名称，完成文件和目录持久化后再发布。"]},
+    {k:"发布 manifest",tag:"REMOTE_READY",on:["jfs","manifest","master"],a:[["jfs","manifest","checksum + commit"],["manifest","master","发布 READY"]],d:["manifest 最后发布，记录 volume ID、generation、size、UUID、checksum 和兼容性信息。","只有 commit marker 存在的模板才允许任何节点启动。"]}
+  ]},
+  {name:"启动沙箱",steps:[
+    {k:"解析 generation",tag:"Cubelet",on:["master","Acl","manifest"],a:[["master","Acl","调度"],["manifest","Acub","解析 volume"]],d:["CubeMaster 选定节点后，Cubelet 根据逻辑模板 ID 解析远端 generation。","持久元数据只保存逻辑卷身份，不保存 /dev/nbdX。"]},
+    {k:"创建 local",tag:"XFS cache",on:["Acl","Acub","Axfs","jfs"],a:[["Acl","Acub","prepare"],["Acub","Anbd","空 local map"],["jfs","Ank","shared UUID"],["Ank","Axfs","创建本地"]],d:["本地没有缓存时创建空 local overlay，并把 base_uuid 指向 shared UUID。","已有且 UUID 匹配则直接复用本地缓存。"]},
+    {k:"连接 NBD",tag:"cubestor connect",on:["Acub","Ank","Anbd","Axfs"],a:[["Acub","Ank","open export"],["Ank","Anbd","映射设备"],["Anbd","Avm","返回路径"]],d:["节点上的长期 nbdkit 通过 export name 打开 local/shared pair。","cubestor 将 export 映射到空闲 /dev/nbdX，并把临时设备路径返回 Cubelet。"]},
+    {k:"启动 VM",tag:"local-first",on:["Acl","Avm","Anbd","Ank","Axfs","jfs"],a:[["Acl","Avm","run"],["Avm","Anbd","rootfs / mmap"],["Anbd","Ank","NBD 读"],["Ank","Axfs","本地命中"],["jfs","Ank","缺页回源"]],d:["rootfs 使用 virtio-blk；memory 使用 NBD backing 的 MAP_PRIVATE。","冷页从 JFS 回源并写入 XFS；热页保持在本地路径。"]}
+  ]},
+  {name:"制作快照",steps:[
+    {k:"冻结与排空",tag:"quiesce",on:["Acl","Avm","Anbd","Axfs"],a:[["Acl","Avm","pause"],["Avm","Anbd","drain + FLUSH"],["Anbd","Axfs","durable"]],d:["暂停 vCPU，排空 virtio-blk 和 NBD 在途请求。","FLUSH 后 rootfs local overlay 必须能够在节点重启后恢复。"]},
+    {k:"克隆 generation",tag:"cubestor clone",on:["Acub","Axfs","jfs"],a:[["Acub","Axfs","XFS reflink"],["jfs","Axfs","JFS 引用"]],d:["rootfs 和 memory 分别创建新的 local/shared 配对 generation。","克隆源必须处于冻结状态或持有稳定 lease，不能一边修改一边 copy。"]},
+    {k:"覆盖脏内存",tag:"dirty pages",on:["Avm","Anbd","Axfs"],a:[["Avm","Anbd","写 snapshot NBD"],["Anbd","Axfs","dirty overlay"]],d:["运行期 memory 写只在匿名 CoW 页里；VMM 此时把 dirty pages 写入新 memory generation。","写完后对目标 export 执行 FLUSH。"]},
+    {k:"本地提交",tag:"LOCAL_READY",on:["Axfs","manifest","master"],a:[["manifest","master","API 返回"],["manifest","Acub","seal local"]],d:["rootfs、memory、VM state 和 local manifest 都持久化后标记 SEALED_LOCAL。","快照 API 可以返回；此时只能在源节点恢复。"]},
+    {k:"异步发布",tag:"REMOTE_READY",on:["Acub","jfs","manifest","master"],a:[["Acub","jfs","publish"],["jfs","manifest","commit marker"],["manifest","master","远端就绪"]],d:["后台把 dirty chunks、map 和 manifest 发布到新的不可变远端 generation。","校验完成并写 commit marker 后，CubeMaster 才允许跨节点恢复。"]}
+  ]},
+  {name:"销毁与缓存",steps:[
+    {k:"断开设备",tag:"disconnect",on:["Acl","Acub","Anbd","Ank"],a:[["Acl","Acub","disconnect"],["Acub","Anbd","detach"],["Anbd","Ank","close export"]],d:["先停止 VM，再断开 NBD。设备号随即可以复用。","vol/generation 与设备映射从运行时注册表删除。"]},
+    {k:"分类 local 数据",tag:"clean vs dirty",on:["Acub","manifest","Axfs"],a:[["manifest","Acub","读取 publish 状态"],["Acub","Axfs","检查 pin"]],d:["FROM_SHARED 或已 REMOTE_READY 的数据是 clean cache，可以保留或淘汰。","尚未发布的 snapshot dirty overlay 必须 pin，它不是缓存，而是唯一数据副本。"]},
+    {k:"容量回收",tag:"watermark GC",on:["Acl","Acub","Axfs","jfs"],a:[["Acl","Acub","LRU 清理"],["Acub","Axfs","淘汰本地"],["jfs","Axfs","远端回收门禁"]],d:["本地达到水位后优先淘汰 clean、未 pin 的 generation。","远端删除必须确认没有模板、快照、active lease、mmap backing 或后代引用。"]}
+  ]},
+  {name:"跨机恢复",steps:[
+    {k:"检查远端就绪",tag:"READY_REMOTE",on:["master","manifest","jfs"],a:[["master","manifest","选择 snapshot"],["jfs","manifest","校验 commit"]],d:["只有 REMOTE_READY generation 能离开源节点。","同时检查 CPU、kernel、hypervisor 和 agent 兼容性。"]},
+    {k:"目标节点建卷",tag:"Node B",on:["Bcl","Bxfs","jfs"],a:[["jfs","Bcl","manifest"],["Bcl","Bxfs","空 local overlay"]],d:["目标节点不复制源节点 cache，只根据远端 UUID 创建新的空 local overlay。","获取新的 writer lease 和 fencing epoch，旧节点不得继续写。"]},
+    {k:"连接并恢复",tag:"lazy hydrate",on:["Bcl","Bvm","Bnbd","Bxfs","jfs"],a:[["Bcl","Bvm","恢复"],["Bvm","Bnbd","rootfs / mmap"],["jfs","Bxfs","miss 回填"]],d:["rootfs 创建新的 writable child；memory 使用 snapshot generation 做 MAP_PRIVATE backing。","首批工作集可以预取，其余数据按需从 JFS 拉取到目标节点 XFS。"]},
+    {k:"接管成功",tag:"new lease",on:["Bvm","Bcl","master"],a:[["Bvm","Bcl","health ready"],["Bcl","master","binding 完成"]],d:["guest health check 成功后更新 sandbox binding。","源节点若恢复，只能把旧 local 数据当无效 lease 下的只读 cache。"]}
+  ]}
+];
+let scen=0,step=0;
+function renderScenarioTabs(){
+  $("#scenario-tabs").innerHTML=scenarios.map((s,i)=>`<button class="tab ${i===scen?"on":""}" data-scen="${i}">${s.name}</button>`).join("");
+}
+function renderFlow(){
+  const S=scenarios[scen], st=S.steps[step], active=new Set(st.on);
+  $("#steps").innerHTML=S.steps.map((x,i)=>`<button class="pill ${i===step?"on":""}" data-step="${i}"><b>${i+1}</b>${x.k}</button>`).join("");
+  let s=`<svg viewBox="0 0 1180 450" xmlns="http://www.w3.org/2000/svg">`;
+  s+=frame(12,24,790,220,"计算节点 A","xfs");
+  s+=frame(816,24,352,220,"计算节点 B","nbd");
+  s+=frame(12,296,1150,140,"控制面与共享层","master");
+  for(const [a,b] of flowEdges){
+    const spec=bestSides(flowNodes,a,b,"");
+    const A=flowNodes[spec[0]], B=flowNodes[spec[2]];
+    const p1=anchor(A,spec[1]), p2=anchor(B,spec[3]);
+    const mid = Math.abs(p1[0]-p2[0])<2 || Math.abs(p1[1]-p2[1])<2
+      ? `M${p1[0]},${p1[1]} L${p2[0]},${p2[1]}`
+      : `M${p1[0]},${p1[1]} L${p2[0]},${p1[1]} L${p2[0]},${p2[1]}`;
+    s+=`<path class="link" d="${mid}"/>`;
+  }
+  for(const [id,b] of Object.entries(flowNodes))s+=box(b,active.has(id)?"on":"dim");
+  const taken=[];
+  for(const a of st.a) s+=drawArrow(flowNodes,bestSides(flowNodes,a[0],a[1],a[2]),taken,{w:1180,h:450});
+  $("#flow-svg").innerHTML=s+"</svg>";
+  $("#flow-info").innerHTML=`<div class="step-no">步骤 ${step+1} / ${S.steps.length}</div><h3>${esc(st.k)}</h3><div class="tag">${esc(st.tag)}</div><ul>${st.d.map(x=>`<li>${x}</li>`).join("")}</ul>`;
+}
+renderScenarioTabs();renderFlow();
+$("#scenario-tabs").onclick=e=>{const b=e.target.closest("[data-scen]");if(!b)return;scen=+b.dataset.scen;step=0;renderScenarioTabs();renderFlow();};
+$("#steps").onclick=e=>{const b=e.target.closest("[data-step]");if(!b)return;step=+b.dataset.step;renderFlow();};
+$("#prev").onclick=()=>{step=(step-1+scenarios[scen].steps.length)%scenarios[scen].steps.length;renderFlow();};
+$("#next").onclick=()=>{step=(step+1)%scenarios[scen].steps.length;renderFlow();};
+document.addEventListener("keydown",e=>{
+  if(!$("#view-flow").classList.contains("on"))return;
+  if(e.key==="ArrowLeft")$("#prev").click();
+  if(e.key==="ArrowRight")$("#next").click();
+});
+</script>
+</body>
+</html>

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubecow"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
 )
 
@@ -29,6 +30,10 @@ const (
 var (
 	ErrHybridNotConfigured = errors.New("hybrid storage is not configured")
 	ErrHybridNotReady      = errors.New("hybrid storage is not ready")
+	// errHybridPublishBusy means the object cannot be merged into the shared
+	// image right now because an export still holds its overlay lock. It is not
+	// a failure: the publisher retries while remote_status stays in progress.
+	errHybridPublishBusy = errors.New("hybrid object is busy")
 )
 
 type hybridCommandRunner func(context.Context, string, ...string) ([]byte, error)
@@ -382,13 +387,19 @@ func (s *HybridStore) syncToShared(ctx context.Context, name string) error {
 	return nil
 }
 
+// CommitTemplateRootfs clones the build rootfs into the template's canonical
+// rootfs name.
+//
+// This entry point is used both by template construction (AppSnapshot, via
+// CommitRootfsFromBuildFor) and by runtime snapshots (CommitSandbox, via
+// CommitRootfsFor). Template construction has no background publisher, so the
+// clone here must reach the shared image before it returns or the template would
+// only be readable on the node that built it. Runtime snapshots publish
+// asynchronously, so the sync would be pure added latency on the critical path.
+//
+// The [publishingStore] interface lets the runtime path opt out of the inline
+// sync without changing the shared Store contract.
 func (s *HybridStore) CommitTemplateRootfs(ctx context.Context, sourceName, templateID string) (*cowVolume, error) {
-	// Publish the CLONE, never the source: the source is the build volume the
-	// temporary sandbox may still be running against, and detaching it would
-	// break that VM. cubestorcli clone copies the local overlay together with
-	// the shared image, so the clone is already byte-complete; syncing the
-	// clone folds its dirty pages into the shared image so other nodes -- which
-	// have no local overlay for this name -- read real content.
 	destination := cowTemplateRootfsName(templateID)
 	volume, err := s.clone(ctx, sourceName, destination, cowKindSnapshot)
 	if err != nil {
@@ -399,6 +410,13 @@ func (s *HybridStore) CommitTemplateRootfs(ctx context.Context, sourceName, temp
 		return nil, errors.Join(fmt.Errorf("publish hybrid template rootfs %s: %w", destination, err), cleanupErr)
 	}
 	return volume, nil
+}
+
+// CommitSnapshotRootfs clones a sandbox rootfs into a snapshot package without
+// publishing it. The publisher merges it into the shared image in the
+// background, so the snapshot RPC does not pay for the copy.
+func (s *HybridStore) CommitSnapshotRootfs(ctx context.Context, sourceName, snapshotID string) (*cowVolume, error) {
+	return s.clone(ctx, sourceName, cowTemplateRootfsName(snapshotID), cowKindSnapshot)
 }
 
 func (s *HybridStore) CreateMemoryVolume(ctx context.Context, templateID string, sizeBytes uint64) (*cowVolume, error) {
@@ -414,6 +432,11 @@ func (s *HybridStore) CreateMemoryVolume(ctx context.Context, templateID string,
 // the clone is already a complete image; publishing the clone is the job of
 // DeactivateByKind once whatever writes into it (the VMM or captureLegacyMemory)
 // has finished and the device is detached.
+//
+// This does NOT publish. Runtime snapshots rely on that: their publisher merges
+// the clone in the background. Template construction must call
+// [HybridStore.PublishTemplateMemory] instead, because nothing else will ever
+// publish it -- see the note there.
 func (s *HybridStore) CommitTemplateMemory(ctx context.Context, sourceName, templateID string, sizeBytes uint64) (*cowVolume, error) {
 	volume, err := s.clone(ctx, sourceName, cowTemplateMemoryName(templateID), cowKindSnapshot)
 	if err != nil {
@@ -431,6 +454,42 @@ func (s *HybridStore) CommitTemplateMemory(ctx context.Context, sourceName, temp
 	}
 	volume.FilePath = dev
 	return volume, nil
+}
+
+// PublishTemplateMemory merges a template's memory image into the shared store.
+//
+// Template construction needs this and runtime snapshots do not. A template is
+// the base every later sandbox clones from, possibly on another node: if its
+// memory only ever existed in this node's local XFS overlay, then a peer has an
+// empty shared image and cannot restore from it at all. Runtime snapshots have
+// the hybridPublisher doing this in the background, so calling it there would
+// only duplicate work.
+//
+// The device must be detached first, which the template path has already done by
+// the time it gets here. A busy object is reported as [errHybridPublishBusy];
+// template construction has no retry loop, so the caller must treat it as a hard
+// failure rather than silently shipping a template only this node can use.
+func (s *HybridStore) PublishTemplateMemory(ctx context.Context, name string) error {
+	if err := validateHybridName(name); err != nil {
+		return err
+	}
+	unlock := s.nameLocks.lock(name)
+	defer unlock()
+	if device, findErr := s.findDevice(ctx, name); findErr != nil {
+		return fmt.Errorf("find hybrid device %s before publish: %w", name, findErr)
+	} else if device != "" {
+		return fmt.Errorf("%w: %s is still attached as %s", errHybridPublishBusy, name, device)
+	}
+	if synced, err := s.volumeSynced(ctx, name); err == nil && synced {
+		return nil
+	}
+	if err := s.syncToShared(ctx, name); err != nil {
+		if isHybridObjectBusy(err) {
+			return fmt.Errorf("%w: %s: %v", errHybridPublishBusy, name, err)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *HybridStore) CloneSandboxMemory(ctx context.Context, sandboxID, sourceName string) (*cowVolume, error) {
@@ -610,15 +669,57 @@ func (s *HybridStore) DeactivateByKind(ctx context.Context, name, kind string) e
 	return nil
 }
 
-// publishVolume merges one volume from the local overlay into the shared image.
+// BeginSnapshotDeactivate flushes a completed snapshot synchronously, then
+// releases its NBD device in the background. The per-name lock is deliberately
+// transferred to the detach goroutine: publish, delete, and a later attach all
+// block until the export is released.
 //
-// cubestorcli sync takes an exclusive flock on the local image, so the export
-// must be detached first. The volume is deliberately NOT re-attached: published
-// content already lives in the shared image, and leaving the export attached
-// after the snapshot RPC has returned races the delete/GC path that is entitled
-// to remove the volume as soon as the caller stops using it (observed as
-// "cubestorcli delete ... is in use"). A later restore attaches on demand
-// through ResolveDevPath.
+// The flush stays on the request path on purpose. The detach runs in the
+// background, and the plugin's own close-time flush_locked discards its error,
+// so without this the RPC would return while the snapshot's dirty pages only
+// existed in nbdkit's memory: a Cubelet restart in that window would lose them.
+// This flush is the durability point for the snapshot; the later close-time
+// flush then finds nothing dirty.
+func (s *HybridStore) BeginSnapshotDeactivate(ctx context.Context, name, kind string) error {
+	if err := validateHybridName(name); err != nil {
+		return err
+	}
+	if err := validateHybridKind(kind); err != nil {
+		return err
+	}
+	unlock := s.nameLocks.lock(name)
+	device, err := s.findDevice(ctx, name)
+	if err != nil {
+		unlock()
+		return err
+	}
+	if device == "" {
+		unlock()
+		return nil
+	}
+	if !s.ownsDevice(name) {
+		if err := s.validateObjectPair(name); err != nil {
+			unlock()
+			return fmt.Errorf("refuse to deactivate unowned hybrid device %s for %s: %w", device, name, err)
+		}
+	}
+	if _, err := s.command(ctx, "flush", "--device", device); err != nil {
+		unlock()
+		return err
+	}
+
+	detachCtx := context.WithoutCancel(ctx)
+	go func() {
+		defer unlock()
+		if _, err := s.command(detachCtx, "detach", "--device", device); err != nil {
+			log.G(detachCtx).Warnf("background hybrid snapshot detach failed: name=%s device=%s: %v", name, device, err)
+			return
+		}
+		s.forgetDevice(name)
+	}()
+	return nil
+}
+
 // publishVolume merges one volume from the local overlay into the shared image.
 //
 // This only ever receives a snapshot's OWN volumes (tpl-snap-<id>-rootfs and
@@ -626,11 +727,21 @@ func (s *HybridStore) DeactivateByKind(ctx context.Context, name, kind string) e
 // is using -- its sb-<id>-rootfs-genN and the template's tpl-<id>-memory -- are
 // never passed here, so publishing cannot disturb a live sandbox.
 //
-// cubestorcli sync takes an exclusive flock on the local image, so the export
-// must not be attached. The snapshot path detaches its own clones before this
-// runs, which makes the detach below a no-op in the common case; it is kept
-// because a restore that arrived between capture and publish leaves the export
-// attached, and a retry must still work.
+// cubestorcli sync takes an exclusive flock on the local image, so it cannot run
+// while any export is attached. That is the correct answer, not a race to
+// schedule around: sync also rewrites the local map and header, which would
+// fight the plugin's in-memory copy on the next close. A busy object is reported
+// as [errHybridPublishBusy] and UploadStatus leaves remote_status in progress,
+// so the publish simply retries once the consumer is gone.
+//
+// Nothing here detaches. Detaching used to look harmless because the snapshot
+// path detaches its own clones before publishing, but the same object NAME is
+// what a restore attaches: tpl-snap-<id>-memory is resolved from the package
+// catalog and attached by ResolveDevPath milliseconds before the shim opens the
+// device to mmap it. A publisher that detached whatever findDevice returned
+// therefore killed the export a restore was about to map, which surfaces as
+// GuestMemoryRegion(MappingPastEof) because the freshly opened device reports
+// size 0.
 //
 // The volume is deliberately NOT re-attached afterwards: the published content
 // lives in the shared image, and leaving an export attached would race the
@@ -641,32 +752,23 @@ func (s *HybridStore) publishVolume(ctx context.Context, name string) error {
 		return err
 	}
 	unlock := s.nameLocks.lock(name)
-	device, findErr := s.findDevice(ctx, name)
-	if findErr != nil {
-		unlock()
+	defer unlock()
+	if device, findErr := s.findDevice(ctx, name); findErr != nil {
 		return fmt.Errorf("find hybrid device %s before publish: %w", name, findErr)
+	} else if device != "" {
+		// Someone is using this object right now -- most often a restore that
+		// attached it to map guest memory. The overlay lock sync needs is held,
+		// so back off instead of guessing whether it is safe to wait.
+		return fmt.Errorf("%w: %s is attached as %s", errHybridPublishBusy, name, device)
 	}
-	if device != "" {
-		// Already detached by the snapshot path in the normal flow.
-		if _, err := s.command(ctx, "flush", "--device", device); err != nil {
-			unlock()
-			return err
-		}
-		if _, err := s.command(ctx, "detach", "--device", device); err != nil {
-			unlock()
-			return err
-		}
-		s.forgetDevice(name)
-	}
-	unlock()
 
 	// Nothing to merge when the overlay already records itself as synced.
 	if synced, err := s.volumeSynced(ctx, name); err == nil && synced {
 		return nil
 	}
 
-	// syncToShared is the slow part; run it without the name lock so unrelated
-	// operations on this object are not blocked behind a full overlay copy.
+	// Keep the per-name lock through the merge. Locks for other objects remain
+	// independent, while attach/delete of this object must not race publication.
 	if err := s.syncToShared(ctx, name); err != nil {
 		// The package may have been deleted while we were merging. Delete now
 		// refuses while remote_status is unsettled, so this is limited to TTL
@@ -674,6 +776,9 @@ func (s *HybridStore) publishVolume(ctx context.Context, name string) error {
 		// publish either way.
 		if snapshotGoneFromLocal(s.localDir, name) {
 			return nil
+		}
+		if isHybridObjectBusy(err) {
+			return fmt.Errorf("%w: %s: %v", errHybridPublishBusy, name, err)
 		}
 		return err
 	}
@@ -685,6 +790,19 @@ func (s *HybridStore) publishVolume(ctx context.Context, name string) error {
 func snapshotGoneFromLocal(localDir, name string) bool {
 	_, err := os.Stat(filepath.Join(localDir, name))
 	return errors.Is(err, os.ErrNotExist)
+}
+
+// isHybridObjectBusy reports whether a cubestorcli error means "another export
+// holds this object" rather than a real failure. cubestorcli reports it as
+// "<path> is in use", which is the message lock_nb dies with.
+func isHybridObjectBusy(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "is in use")
+}
+
+// isHybridObjectMissing reports whether cubestorcli failed because the file is
+// not there. cubestorcli dies with "open <dir>/<name>: No such file or directory".
+func isHybridObjectMissing(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "No such file")
 }
 
 // volumeSynced reports whether the shared image already contains every page of
@@ -724,6 +842,12 @@ func (s *HybridStore) deactivateLocked(ctx context.Context, name string) error {
 			return fmt.Errorf("refuse to deactivate unowned hybrid device %s for %s: %w", device, name, err)
 		}
 	}
+	// Flush, then detach. detach only sends NBD_DISCONNECT; it does not flush,
+	// so without this the guest's last writes are still in the page cache and
+	// the disconnect discards them ("lost async page write" in dmesg, and a
+	// memory image with zero data blocks). The plugin also flushes in
+	// cubestor_close, but that runs after the disconnect and its error is
+	// discarded, so it cannot be the durability point.
 	if _, err := s.command(ctx, "flush", "--device", device); err != nil {
 		return err
 	}
@@ -766,29 +890,49 @@ func (s *HybridStore) deleteLocked(ctx context.Context, name string) error {
 	return err
 }
 
+// GetSizeBytes reports an object's virtual size.
+//
+// It reads the local overlay first. Both sides carry the same virtual_size (a
+// clone writes the same header to each, and create takes it from the shared
+// image), but the shared side lives on JuiceFS: reading its header there costs a
+// network round trip, measured at 80ms per call on c1, while the local XFS read
+// is effectively free. Every clone finishes by asking for the size of what it
+// just produced, so that 80ms sat on the snapshot path.
+//
+// The shared copy is the fallback, for an object that has no local overlay on
+// this node -- e.g. a package published elsewhere and only present remotely.
 func (s *HybridStore) GetSizeBytes(ctx context.Context, name string) (uint64, error) {
 	if err := validateHybridName(name); err != nil {
 		return 0, err
 	}
-	out, err := s.command(ctx, "info", "--dir", s.sharedDir, "--name", name)
-	if err != nil {
-		if strings.Contains(err.Error(), "No such file") {
-			return 0, &CowObjectMissingError{VolumeName: name, Cause: err}
-		}
-		return 0, err
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 || fields[0] != "virtual_size" {
-			continue
-		}
-		size, parseErr := strconv.ParseUint(fields[1], 10, 64)
-		if parseErr != nil {
-			return 0, fmt.Errorf("parse cubestorcli size for %s: %w", name, parseErr)
-		}
+	size, err := s.sizeFrom(ctx, s.localDir, name)
+	if err == nil {
 		return size, nil
 	}
-	return 0, fmt.Errorf("cubestorcli info %s returned no virtual_size", name)
+	if !isHybridObjectMissing(err) {
+		return 0, err
+	}
+	size, sharedErr := s.sizeFrom(ctx, s.sharedDir, name)
+	if sharedErr != nil {
+		if isHybridObjectMissing(sharedErr) {
+			return 0, &CowObjectMissingError{VolumeName: name, Cause: sharedErr}
+		}
+		return 0, sharedErr
+	}
+	return size, nil
+}
+
+// sizeFrom reads virtual_size from one of the two directories.
+func (s *HybridStore) sizeFrom(ctx context.Context, dir, name string) (uint64, error) {
+	out, err := s.command(ctx, "size", "--dir", dir, "--name", name)
+	if err != nil {
+		return 0, err
+	}
+	size, parseErr := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64)
+	if parseErr != nil {
+		return 0, fmt.Errorf("parse cubestorcli size for %s in %s: %w", name, dir, parseErr)
+	}
+	return size, nil
 }
 
 func (s *HybridStore) GetVolumeInfo(ctx context.Context, name string) (*cubecow.Volume, error) {
@@ -861,6 +1005,8 @@ func (s *HybridStore) Close(ctx context.Context) error {
 			unlock()
 			continue
 		}
+		// Flush before detach for the same reason as deactivateLocked: detach
+		// only disconnects, which discards whatever is still in the page cache.
 		if _, err := s.command(ctx, "flush", "--device", device); err != nil {
 			closeErr = errors.Join(closeErr, fmt.Errorf("flush hybrid object %s: %w", name, err))
 			unlock()

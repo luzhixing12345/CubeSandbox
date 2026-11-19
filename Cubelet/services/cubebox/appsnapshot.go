@@ -495,6 +495,21 @@ func (s *service) AppSnapshot(ctx context.Context, req *cubebox.AppSnapshotReque
 		return rsp, nil
 	}
 
+	// A template must be complete in the shared store before it is announced as
+	// READY. Runtime snapshots have the hybridPublisher merging their package in
+	// the background; template construction has nobody, so without this the
+	// memory image would exist only in this node's local XFS overlay. A peer
+	// cloning from the template would then read an empty shared image, and a
+	// restart on a node without that overlay would silently boot a zeroed
+	// memory. Publishing here is what makes the template usable off-node.
+	if err := publishTemplateMemoryObject(ctx, stepLog, backend, memoryObject); err != nil {
+		cleanupSnapshotObjects()
+		layout.discardTmpDir()
+		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+		rsp.Ret.RetMsg = fmt.Sprintf("failed to publish template memory to shared storage: %v", err)
+		return rsp, nil
+	}
+
 	if layout.usesTmpRename() {
 		stepLog.Info("Step 6: Moving snapshot to final path...")
 
@@ -949,6 +964,21 @@ func alignUp(value, alignment uint64) uint64 {
 
 func cleanupCowSnapshotObjects(ctx context.Context, stepLog *log.CubeWrapperLogEntry, memoryObject, rootfsObject *storage.CowSnapshotObject) {
 	cleanupCowSnapshotObjectsOn(ctx, stepLog, "", memoryObject, rootfsObject)
+}
+
+// publishTemplateMemoryObject merges a finished template's memory image into the
+// shared store. Backends without a shared layer (xfs) are a no-op.
+//
+// Only template construction calls this: it is the one path whose artifact has
+// no background publisher, and whose memory must be readable from every node.
+func publishTemplateMemoryObject(ctx context.Context, stepLog *log.CubeWrapperLogEntry, backend string, memoryObject *storage.CowSnapshotObject) error {
+	if memoryObject == nil || strings.TrimSpace(memoryObject.Name) == "" {
+		return nil
+	}
+	if strings.TrimSpace(backend) == "" {
+		return storage.PublishTemplateMemory(ctx, memoryObject.Name)
+	}
+	return storage.PublishTemplateMemoryFor(ctx, backend, memoryObject.Name)
 }
 
 func cleanupCowSnapshotObjectsOn(ctx context.Context, stepLog *log.CubeWrapperLogEntry, backend string, memoryObject, rootfsObject *storage.CowSnapshotObject) {

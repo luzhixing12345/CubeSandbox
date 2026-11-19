@@ -241,9 +241,13 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		return rsp, nil
 	}
 
+	frozenCtx, frozenCancel := detachedSnapshotWorkContext(ctx)
+	defer frozenCancel()
 	cleanupArtifacts := func() {
+		cleanupCtx, cleanupCancel := detachedSnapshotWorkContext(ctx)
+		defer cleanupCancel()
 		cleanupPreparedLayout()
-		cleanupCowSnapshotObjectsOn(ctx, stepLog, backend, payload.memory, rootfsObject)
+		cleanupCowSnapshotObjectsOn(cleanupCtx, stepLog, backend, payload.memory, rootfsObject)
 	}
 
 	if layoutErr != nil {
@@ -259,8 +263,6 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 	// when degrading because no base could be resolved. AppSnapshot keeps
 	// using the default full type via its own call site.
 	stepLog = stepLog.WithFields(CubeLog.Fields{"snapshotType": snapshotTypeForCmd, "snapshotMode": mode})
-	frozenCtx, frozenCancel := detachedSnapshotWorkContext(ctx)
-	defer frozenCancel()
 	var bindingErr error
 	var snapshotErr, rootfsErr, resumeErr error
 
@@ -300,6 +302,7 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		return snapshotErr, rootfsErr
 	}
 
+	memoryDeactivateStarted := false
 	if useCoordinatedSnapshotPath(shimCapability, mode) {
 		captureStarted := false
 		var freezeLease *snapshotFreezeLease
@@ -347,10 +350,27 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 			}
 			return snapshotCaptureError(captureErr)
 		}, func() error {
-			rootfsObject, err = storage.CommitRootfsFor(frozenCtx, backend, sourceRootfs, rsp.TemplateID)
+			type rootfsCommitResult struct {
+				object *storage.CowSnapshotObject
+				err    error
+			}
+			rootfsReady := make(chan rootfsCommitResult, 1)
+			go func() {
+				object, commitErr := storage.CommitRootfsFor(frozenCtx, backend, sourceRootfs, rsp.TemplateID)
+				rootfsReady <- rootfsCommitResult{object: object, err: commitErr}
+			}()
+
+			var deactivateErr error
+			if payload.memory != nil && payload.memory.Name != "" {
+				memoryDeactivateStarted, deactivateErr = storage.BeginSnapshotDeactivateFor(
+					frozenCtx, backend, payload.memory.Name, payload.memory.Kind,
+				)
+			}
+			rootfsResult := <-rootfsReady
+			rootfsObject, err = rootfsResult.object, rootfsResult.err
 			stage("commit-rootfs")
-			if err != nil {
-				return err
+			if err != nil || deactivateErr != nil {
+				return errors.Join(err, deactivateErr)
 			}
 			return frozenCtx.Err()
 		}, func() error {
@@ -422,8 +442,18 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		rsp.Ret.RetMsg = fmt.Sprintf("failed to resume sandbox after snapshot: %v", resumeErr)
 		return rsp, nil
 	}
-	// Do not write memory.dev — restore uses catalog vol name + ResolveDevPath.
-	if err := deactivateCowSnapshotObjectsOn(ctx, stepLog, backend, payload.memory, rootfsObject); err != nil {
+	// Flush snapshot volumes before returning. Hybrid releases the memory NBD
+	// asynchronously after the flush; its per-object lock fences the publisher
+	// until the kernel has actually freed the device.
+	//
+	// The VMM does not fsync the memory device after dumping dirty pages, and
+	// the cubestor plugin only pwrite()s into the page cache, so without this
+	// the snapshot's bytes are durable on nothing but cache.
+	memoryToDeactivate := payload.memory
+	if memoryDeactivateStarted {
+		memoryToDeactivate = nil
+	}
+	if err := deactivateCowSnapshotObjectsOn(frozenCtx, stepLog, backend, memoryToDeactivate, rootfsObject); err != nil {
 		cleanupArtifacts()
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
 		rsp.Ret.RetMsg = fmt.Sprintf("failed to deactivate snapshot objects: %v", err)

@@ -239,6 +239,37 @@ func CommitRootfs(ctx context.Context, source *CowSnapshotObject, id string) (*C
 	return CommitRootfsFor(ctx, cow.BackendXFS, source, id)
 }
 
+// publishingStore is an optional extension of [cow.Store] for backends that
+// publish asynchronously. Runtime snapshots call CommitSnapshotRootfs so the
+// clone is not forced into the shared image on the request's critical path;
+// template construction keeps using CommitTemplateRootfs, which must publish
+// before returning because nothing else will.
+type publishingStore interface {
+	CommitSnapshotRootfs(ctx context.Context, sourceName, snapshotID string) (*cowVolume, error)
+}
+
+// snapshotAsyncDeactivator makes snapshot data durable before returning, then
+// releases its host device in the background. Implementations must fence later
+// attach, delete, and publish operations until that release has completed.
+type snapshotAsyncDeactivator interface {
+	BeginSnapshotDeactivate(ctx context.Context, name, kind string) error
+}
+
+// BeginSnapshotDeactivateFor starts the optimized snapshot-only deactivate
+// path when backend supports it. handled=false means callers must use the
+// ordinary synchronous DeactivateObjectFor path.
+func BeginSnapshotDeactivateFor(ctx context.Context, backend, name, kind string) (handled bool, err error) {
+	store, err := requireCowStoreFor(backend)
+	if err != nil {
+		return false, err
+	}
+	async, ok := store.(snapshotAsyncDeactivator)
+	if !ok || async == nil {
+		return false, nil
+	}
+	return true, async.BeginSnapshotDeactivate(ctx, name, kind)
+}
+
 // CommitRootfsFor is [CommitRootfs] on the Store selected by backend (request `type`).
 func CommitRootfsFor(ctx context.Context, backend string, source *CowSnapshotObject, id string) (*CowSnapshotObject, error) {
 	store, err := requireCowStoreFor(backend)
@@ -248,7 +279,12 @@ func CommitRootfsFor(ctx context.Context, backend string, source *CowSnapshotObj
 	if source == nil || source.Name == "" {
 		return nil, fmt.Errorf("source rootfs is required")
 	}
-	volume, err := store.CommitTemplateRootfs(ctx, source.Name, id)
+	var volume *cowVolume
+	if async, ok := store.(publishingStore); ok && async != nil {
+		volume, err = async.CommitSnapshotRootfs(ctx, source.Name, id)
+	} else {
+		volume, err = store.CommitTemplateRootfs(ctx, source.Name, id)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -338,6 +374,36 @@ func DeactivateObjectFor(ctx context.Context, backend, name, kind string) error 
 		return err
 	}
 	return store.DeactivateByKind(ctx, name, kind)
+}
+
+// templatePublisher is implemented by backends that keep a local overlay over a
+// shared store and therefore must explicitly publish a template's memory image.
+// Backends without that layering do not implement it, and publishing is a no-op.
+type templatePublisher interface {
+	PublishTemplateMemory(ctx context.Context, name string) error
+}
+
+// PublishTemplateMemory merges a template memory image into the shared store on
+// the default (xfs) backend.
+func PublishTemplateMemory(ctx context.Context, name string) error {
+	return PublishTemplateMemoryFor(ctx, cow.BackendXFS, name)
+}
+
+// PublishTemplateMemoryFor is [PublishTemplateMemory] on the Store for backend.
+//
+// Template construction is the only caller: runtime snapshots publish through
+// the background hybridPublisher instead. A backend that does not layer a local
+// overlay over a shared store has nothing to publish and returns nil.
+func PublishTemplateMemoryFor(ctx context.Context, backend, name string) error {
+	store, err := requireCowStoreFor(backend)
+	if err != nil {
+		return err
+	}
+	publisher, ok := store.(templatePublisher)
+	if !ok || publisher == nil {
+		return nil
+	}
+	return publisher.PublishTemplateMemory(ctx, name)
 }
 
 // ResolveObjectPath resolves a CoW object to a device/file path on the default Store.

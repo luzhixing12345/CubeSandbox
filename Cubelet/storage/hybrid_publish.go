@@ -43,6 +43,11 @@ type hybridPublishState struct {
 	err       error
 	uuids     *cow.RemoteUUIDs
 	queuedMsg string
+
+	// busyRetries counts how many times the merge was deferred because an
+	// export still held the object. Surfaced through UploadStatus so a package
+	// that stays busy is visible instead of looking stuck.
+	busyRetries int
 }
 
 func newHybridPublisher(store *HybridStore) *hybridPublisher {
@@ -82,7 +87,31 @@ func (p *hybridPublisher) start(id string) {
 		// already returned, so its context is cancelled.
 		ctx, cancel := context.WithTimeout(context.Background(), hybridPublishTimeout)
 		defer cancel()
-		state.err = p.publish(ctx, id)
+		// A busy object is not a failure: another export (usually a restore
+		// mapping this package's memory) still holds its overlay lock, and
+		// there is nothing to do but wait for it. Keeping the state alive keeps
+		// remote_status in progress, which is what Master polls.
+		for {
+			err := p.publish(ctx, id)
+			if err == nil || !errors.Is(err, errHybridPublishBusy) {
+				p.mu.Lock()
+				state.err = err
+				p.mu.Unlock()
+				break
+			}
+			p.mu.Lock()
+			state.busyRetries++
+			p.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				p.mu.Lock()
+				state.err = fmt.Errorf("publish %s still busy after %s: %w", id, hybridPublishTimeout, ctx.Err())
+				p.mu.Unlock()
+				goto done
+			case <-time.After(hybridPublishBusyRetry):
+			}
+		}
+	done:
 		p.mu.Lock()
 		state.finished = time.Now()
 		p.mu.Unlock()
@@ -149,10 +178,17 @@ func (p *hybridPublisher) UploadStatus(ctx context.Context, snapshotID string) (
 			RemoteUUIDs: state.uuids,
 		}, nil
 	default:
+		p.mu.Lock()
+		retries := state.busyRetries
+		p.mu.Unlock()
+		message := fmt.Sprintf("publishing for %s", time.Since(state.started).Round(time.Second))
+		if retries > 0 {
+			message += fmt.Sprintf(", deferred %d time(s): an export still holds the object", retries)
+		}
 		return &cow.RemoteStatus{
 			SnapshotID: id,
 			State:      cow.RemoteStateRunning,
-			Message:    fmt.Sprintf("publishing for %s", time.Since(state.started).Round(time.Second)),
+			Message:    message,
 		}, nil
 	}
 }
@@ -218,6 +254,12 @@ func firstOr(names []string, i int) string {
 }
 
 const hybridPublishTimeout = 30 * time.Minute
+
+// hybridPublishBusyRetry spaces out retries while an export still holds the
+// object. A restore attaches its memory right before mapping it and detaches it
+// when the sandbox is destroyed, so the wait can legitimately be long; the
+// publish is idempotent and costs one `devices` call per tick.
+const hybridPublishBusyRetry = 2 * time.Second
 
 // hybridPublishers keeps one publisher per HybridStore so a snapshot upload and
 // the status poll that follows it observe the same in-flight state.
