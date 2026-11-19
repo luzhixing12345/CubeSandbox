@@ -1108,11 +1108,25 @@ func (l *local) prefetchRestoreMemoryVolURL(ctx context.Context, opts *workflow.
 	if err != nil {
 		return "", "", err
 	}
-	devPath, err := store.ResolveDevPath(ctx, volumeName, normalizedKind)
+	var devPath string
+	// A runtime snapshot may still be publishing. Hybrid seals its completed
+	// memory before sharing it, allowing background upload during restore reads.
+	if resolver, ok := store.(snapshotMemoryResolver); ok &&
+		strings.TrimSpace(annotations[constants.MasterAnnotationRuntimeSnapshotID]) != "" {
+		devPath, err = resolver.ResolveSnapshotMemory(ctx, volumeName, normalizedKind)
+	} else {
+		devPath, err = store.ResolveDevPath(ctx, volumeName, normalizedKind)
+	}
 	if err != nil {
 		return "", "", fmt.Errorf("resolve snapshot memory volume %s: %w", volumeName, err)
 	}
 	return cowFileURLFromPath(devPath), "", nil
+}
+
+// snapshotMemoryResolver prepares an immutable runtime snapshot before its
+// memory is mapped by a restore. Capture paths must continue using ResolveDevPath.
+type snapshotMemoryResolver interface {
+	ResolveSnapshotMemory(context.Context, string, string) (string, error)
 }
 
 // pauseResumeClonesLiveMemory is true when same-node pause resume must

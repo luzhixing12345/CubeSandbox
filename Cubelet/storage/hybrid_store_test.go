@@ -581,7 +581,8 @@ func TestHybridCommitTemplateMemoryLeavesLiveSourceAttached(t *testing.T) {
 	joined := strings.Join(*calls, "\n")
 	for _, forbidden := range []string{"detach", "sync "} {
 		if strings.Contains(joined, forbidden) {
-			t.Fatalf("memory commit must not %q the running source:\n%s", forbidden, joined)		}
+			t.Fatalf("memory commit must not %q the running source:\n%s", forbidden, joined)
+		}
 	}
 }
 
@@ -689,61 +690,52 @@ func TestHybridDeactivateDoesNotPublishInline(t *testing.T) {
 	}
 }
 
-func TestHybridBeginSnapshotDeactivateFlushesThenFencesAsyncDetach(t *testing.T) {
+func TestHybridBeginSnapshotDeactivateSealsAndRetainsDevice(t *testing.T) {
 	store, calls := newFakeHybridStore(t)
 	name := "tpl-snap-x-memory"
 	for _, dir := range []string{store.localDir, store.sharedDir} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte("image"), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("image"), 0600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	store.ownedDevice = map[string]string{name: "/dev/nbd2"}
-	detachStarted := make(chan struct{})
-	releaseDetach := make(chan struct{})
+	store.readDevice = func(string) (hybridDeviceIdentity, error) {
+		return hybridDeviceIdentity{PID: "123", Start: "456", Socket: store.socketPath, Name: name}, nil
+	}
+	store.rememberDevice(name, "/dev/nbd2")
 	store.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		*calls = append(*calls, strings.Join(args, " "))
-		switch args[0] {
-		case "devices":
+		if args[0] == "devices" {
 			return []byte("nbd2 size 8192 plugin cubestor name " + name), nil
-		case "detach":
-			close(detachStarted)
-			<-releaseDetach
 		}
 		return []byte("ok\n"), nil
 	}
-
 	if err := store.BeginSnapshotDeactivate(context.Background(), name, cowKindSnapshot); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-detachStarted:
-	case <-time.After(time.Second):
-		t.Fatal("background detach did not start")
-	}
 	joined := strings.Join(*calls, "\n")
-	if !strings.Contains(joined, "flush --device /dev/nbd2") {
-		t.Fatalf("flush did not complete before return:\n%s", joined)
+	if !strings.Contains(joined, "flush --to-page-cache --unix "+store.socketPath+" --device /dev/nbd2 --name "+name) {
+		t.Fatalf("missing synchronous seal: %s", joined)
 	}
-
-	lockAcquired := make(chan struct{})
-	go func() {
-		unlock := store.nameLocks.lock(name)
-		close(lockAcquired)
-		unlock()
-	}()
-	select {
-	case <-lockAcquired:
-		t.Fatal("name lock was released before detach completed")
-	case <-time.After(20 * time.Millisecond):
+	if !store.ownsDevice(name) || !store.isSealed(name) {
+		t.Fatal("finalization must retain the sealed device")
 	}
-	close(releaseDetach)
-	select {
-	case <-lockAcquired:
-	case <-time.After(time.Second):
-		t.Fatal("name lock remained fenced after detach completed")
+	*calls = nil
+	if err := store.BeginSnapshotDeactivate(context.Background(), name, cowKindSnapshot); err != nil {
+		t.Fatal(err)
 	}
-	if store.ownsDevice(name) {
-		t.Fatal("device ownership was retained after successful detach")
+	if dev, err := store.ResolveSnapshotMemory(context.Background(), name, cowKindSnapshot); err != nil || dev != "/dev/nbd2" {
+		t.Fatalf("restore did not reuse device: %s %v", dev, err)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("restore performed persistence or preparation: %v", *calls)
+	}
+	if err := store.publishVolume(context.Background(), name); err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range *calls {
+		if !strings.HasPrefix(call, "sync --immutable ") && !strings.HasPrefix(call, "flush --sync-page-cache ") {
+			t.Fatalf("finalized capture repeated preparation: %s", call)
+		}
 	}
 }
 
@@ -777,7 +769,7 @@ func TestHybridPublishVolumeNeverDetachesOrReattaches(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(*calls, "\n")
-	if !strings.Contains(joined, "sync --local-dir "+store.localDir) {
+	if !strings.Contains(joined, "sync --immutable --local-dir "+store.localDir) {
 		t.Fatalf("publish must sync:\n%s", joined)
 	}
 	for _, forbidden := range []string{"detach", "attach "} {
@@ -787,10 +779,8 @@ func TestHybridPublishVolumeNeverDetachesOrReattaches(t *testing.T) {
 	}
 }
 
-// A restore that attached the package object holds the overlay lock, so the
-// merge cannot run. That is reported as busy, which the publisher retries instead
-// of treating as a failure -- and it must never touch the device.
-func TestHybridPublishVolumeReportsBusyWhenAttached(t *testing.T) {
+// Attached sealed snapshots can publish without inspecting or touching devices.
+func TestHybridPublishVolumeAllowsAttachedSnapshot(t *testing.T) {
 	t.Parallel()
 	store, calls := newFakeHybridStore(t)
 	name := "tpl-snap-busy-memory"
@@ -808,13 +798,13 @@ func TestHybridPublishVolumeReportsBusyWhenAttached(t *testing.T) {
 	}
 
 	err := store.publishVolume(context.Background(), name)
-	if !errors.Is(err, errHybridPublishBusy) {
-		t.Fatalf("publish error=%v, want busy", err)
+	if err != nil {
+		t.Fatal(err)
 	}
 	joined := strings.Join(*calls, "\n")
-	for _, forbidden := range []string{"detach", "sync "} {
+	for _, forbidden := range []string{"detach", "devices"} {
 		if strings.Contains(joined, forbidden) {
-			t.Fatalf("a busy publish must not %q:\n%s", forbidden, joined)
+			t.Fatalf("immutable publish must not %q:\n%s", forbidden, joined)
 		}
 	}
 }
@@ -1064,36 +1054,17 @@ func TestHybridPublishTargetsOnlySnapshotOwnedVolumes(t *testing.T) {
 	}
 }
 
-// An already-synced overlay has nothing to merge, so publish must not pay for a
-// second full copy (it is a no-op that costs seconds on a large volume).
-func TestHybridPublishSkipsAlreadySyncedVolume(t *testing.T) {
-	t.Parallel()
-	store, calls := newFakeHybridStore(t)
-	name := "tpl-snap-synced-memory"
-	store.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
-		*calls = append(*calls, strings.Join(args, " "))
-		switch args[0] {
-		case "devices":
-			return nil, nil // already detached
-		case "info":
-			return []byte("flags clean synced\ngeneration 3\n"), nil
-		}
-		return []byte("ok\n"), nil
-	}
-
-	if err := store.publishVolume(context.Background(), name); err != nil {
-		t.Fatal(err)
-	}
-	for _, call := range *calls {
-		if strings.HasPrefix(call, "sync ") {
-			t.Fatalf("a synced volume must not be re-copied: %v", *calls)
-		}
-	}
-}
-
 func TestHybridCloseDetachesOnlyOwnedDevices(t *testing.T) {
 	t.Parallel()
 	store, calls := newFakeHybridStore(t)
+	store.readDevice = func(device string) (hybridDeviceIdentity, error) {
+		for name, dev := range store.ownedDevice {
+			if dev == device {
+				return hybridDeviceIdentity{PID: "100", Start: "1", Name: name, Socket: store.socketPath}, nil
+			}
+		}
+		return hybridDeviceIdentity{}, os.ErrNotExist
+	}
 	store.ownedDevice = map[string]string{"owned": "/dev/nbd7"}
 
 	if err := store.Close(context.Background()); err != nil {
@@ -1115,13 +1086,21 @@ func TestHybridCloseDetachesOnlyOwnedDevices(t *testing.T) {
 func TestHybridCloseContinuesAfterOneDetachFailure(t *testing.T) {
 	t.Parallel()
 	store, calls := newFakeHybridStore(t)
+	store.readDevice = func(device string) (hybridDeviceIdentity, error) {
+		for name, dev := range store.ownedDevice {
+			if dev == device {
+				return hybridDeviceIdentity{PID: "100", Start: "1", Name: name, Socket: store.socketPath}, nil
+			}
+		}
+		return hybridDeviceIdentity{}, os.ErrNotExist
+	}
 	store.ownedDevice = map[string]string{
 		"bad":  "/dev/nbd7",
 		"good": "/dev/nbd8",
 	}
 	store.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		*calls = append(*calls, strings.Join(args, " "))
-		if args[0] == "detach" && args[len(args)-1] == "/dev/nbd7" {
+		if args[0] == "detach" && args[2] == "/dev/nbd7" {
 			return nil, errors.New("detach failed")
 		}
 		return []byte("ok\n"), nil
@@ -1146,6 +1125,14 @@ func TestHybridCloseContinuesAfterOneDetachFailure(t *testing.T) {
 func TestLocalCloseClearsHybridManagerOnError(t *testing.T) {
 	t.Parallel()
 	store, _ := newFakeHybridStore(t)
+	store.readDevice = func(device string) (hybridDeviceIdentity, error) {
+		for name, dev := range store.ownedDevice {
+			if dev == device {
+				return hybridDeviceIdentity{PID: "100", Start: "1", Name: name, Socket: store.socketPath}, nil
+			}
+		}
+		return hybridDeviceIdentity{}, os.ErrNotExist
+	}
 	store.ownedDevice = map[string]string{"bad": "/dev/nbd7"}
 	store.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		if args[0] == "detach" {
@@ -1251,4 +1238,81 @@ func TestRefreshCowPathsClearsHybridDevicePaths(t *testing.T) {
 
 func errorsIs(err, target error) bool {
 	return errors.Is(err, target)
+}
+
+func TestHybridCloneReturnsSizeAndSkipsFreshDeviceDiscovery(t *testing.T) {
+	store, calls := newFakeHybridStore(t)
+	ctx := context.Background()
+	if _, err := store.ResolveDevPath(ctx, "source", cowKindVolume); err != nil {
+		t.Fatal(err)
+	}
+	oldRun := store.run
+	store.run = func(ctx context.Context, path string, args ...string) ([]byte, error) {
+		if args[0] == "clone" {
+			return []byte("cloned source -> destination\nsize 8388608\n"), nil
+		}
+		if args[0] == "size" {
+			t.Fatal("clone must reuse returned size")
+		}
+		return oldRun(ctx, path, args...)
+	}
+	volume, err := store.clone(ctx, "source", "destination", cowKindSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if volume.SizeBytes != 8388608 {
+		t.Fatalf("size=%d", volume.SizeBytes)
+	}
+	before := len(*calls)
+	if err := store.DeactivateByKind(ctx, "destination", cowKindSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(*calls) != before {
+		t.Fatalf("fresh unattached object invoked CLI: %v", (*calls)[before:])
+	}
+	if _, err := store.ResolveDevPath(ctx, "destination", cowKindSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range (*calls)[before:] {
+		if call == "devices" {
+			t.Fatal("fresh attach enumerated devices")
+		}
+	}
+	store.devMu.Lock()
+	fresh := store.unattached["destination"]
+	store.devMu.Unlock()
+	if fresh {
+		t.Fatal("attached object retained unattached state")
+	}
+}
+
+func TestHybridPageCachePersistenceFailurePreventsUpload(t *testing.T) {
+	s, calls := newFakeHybridStore(t)
+	name := "tpl-snap-pending-memory"
+	s.rememberSealed(name)
+	s.pendingPersist = map[string]bool{name: true}
+	base := s.run
+	fail := true
+	s.run = func(ctx context.Context, path string, args ...string) ([]byte, error) {
+		if args[0] == "flush" && fail {
+			return nil, errors.New("injected persistence failure")
+		}
+		return base(ctx, path, args...)
+	}
+	if err := s.publishVolume(context.Background(), name); err == nil {
+		t.Fatal("expected persistence failure")
+	}
+	if len(*calls) != 0 || !s.pendingPersist[name] {
+		t.Fatal("failed persistence uploaded or forgot pending state")
+	}
+	fail = false
+	if err := s.publishVolume(context.Background(), name); err != nil {
+		t.Fatal(err)
+	}
+	if len(*calls) != 2 || !strings.HasPrefix((*calls)[0], "flush --sync-page-cache ") || !strings.HasPrefix((*calls)[1], "sync --immutable ") {
+		t.Fatalf("wrong publish order: %v", *calls)
+	}
+	if s.pendingPersist[name] {
+		t.Fatal("durable snapshot remained pending")
+	}
 }

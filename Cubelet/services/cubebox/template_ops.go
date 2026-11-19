@@ -442,13 +442,13 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		rsp.Ret.RetMsg = fmt.Sprintf("failed to resume sandbox after snapshot: %v", resumeErr)
 		return rsp, nil
 	}
-	// Flush snapshot volumes before returning. Hybrid releases the memory NBD
-	// asynchronously after the flush; its per-object lock fences the publisher
-	// until the kernel has actually freed the device.
+	// Finalize snapshot volumes before returning. Hybrid drains memory writes
+	// into local cache and freezes the retained export. Its publisher completes
+	// local durability before uploading.
 	//
 	// The VMM does not fsync the memory device after dumping dirty pages, and
 	// the cubestor plugin only pwrite()s into the page cache, so without this
-	// the snapshot's bytes are durable on nothing but cache.
+	// even the plugin may not have received all captured bytes.
 	memoryToDeactivate := payload.memory
 	if memoryDeactivateStarted {
 		memoryToDeactivate = nil

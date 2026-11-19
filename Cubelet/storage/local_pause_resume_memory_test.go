@@ -144,3 +144,31 @@ func TestPrefetchRestoreMemoryVolURLS3PauseResumeClones(t *testing.T) {
 	require.Equal(t, []fakeCowCloneMemoryCall{{sandboxID: "sb-1", sourceName: "tpl-snap-pause1-memory"}}, s3.cloneMemoryCalls)
 	require.Empty(t, xfs.cloneMemoryCalls)
 }
+
+type fakeSnapshotMemoryManager struct {
+	fakeCowVolumeManager
+	restored string
+}
+
+func (m *fakeSnapshotMemoryManager) ResolveSnapshotMemory(_ context.Context, name, kind string) (string, error) {
+	m.restored = name
+	return "/dev/mapper/published-memory", nil
+}
+func TestPrefetchHybridRuntimeSnapshotPreparesSharedMemory(t *testing.T) {
+	cfg := makeTestConfig(t)
+	cfg.StorageBackend = "cubecow"
+	hybrid := &fakeSnapshotMemoryManager{}
+	l := &local{config: cfg, cowManager: &fakeCowVolumeManager{}, hybridManager: hybrid}
+	require.NoError(t, l.init(&plugin.InitContext{Context: context.Background()}))
+	seedTestSnapshotCatalogFor(t, cow.BackendHybrid, "snap-publishing", "tpl-snap-publishing-memory", CowKindSnapshot)
+	url, owned, err := l.prefetchRestoreMemoryVolURL(context.Background(), pauseResumeCreateContext("restore-1", map[string]string{
+		constants.MasterAnnotationRuntimeSnapshotID: "snap-publishing",
+		constants.MasterAnnotationStorageBackend:    cow.BackendHybrid,
+	}))
+	require.NoError(t, err)
+	require.Equal(t, "file:///dev/mapper/published-memory", url)
+	require.Empty(t, owned)
+	require.Equal(t, "tpl-snap-publishing-memory", hybrid.restored)
+	require.Empty(t, hybrid.cloneMemoryCalls)
+	require.Empty(t, hybrid.resolveCalls)
+}

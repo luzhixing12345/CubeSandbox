@@ -109,7 +109,8 @@ func checkCommitSnapshotDestination(ctx context.Context, backend, snapshotID str
 	// redundant for XFS and turns every new JFS name into a full directory
 	// discovery. S3 retains the preflight because some create paths resolve and
 	// reuse existing writable lvols.
-	if cow.IsReflinkBackend(backend) {
+	// Hybrid clone also atomically rejects existing destinations.
+	if cow.IsReflinkBackend(backend) || backend == cow.BackendHybrid {
 		return nil
 	}
 	// Include work and sealed objects: S3 may resolve an existing writable

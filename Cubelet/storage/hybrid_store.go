@@ -16,8 +16,9 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubecow"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
 )
 
@@ -48,7 +49,7 @@ type hybridCommandRunner func(context.Context, string, ...string) ([]byte, error
 // so a single mutex serialized every concurrent sandbox creation and made
 // template start scale linearly worse with concurrency. Instead:
 //
-//   - devMu guards ownedDevice only; every critical section is a map read or
+//   - devMu guards ownedDevice and bindings; every critical section is a map read or
 //     write.
 //   - nameLocks serializes the attach/detach lifecycle of ONE object, which is
 //     what actually needs ordering: two attaches for the same export would
@@ -65,13 +66,23 @@ type HybridStore struct {
 	timeout         time.Duration
 	run             hybridCommandRunner
 
-	devMu       sync.Mutex
-	ownedDevice map[string]string
-	nameLocks   keyedMutex
+	devMu          sync.Mutex
+	sealed         map[string]bool // Immutable in this process, possibly awaiting persistence.
+	pendingPersist map[string]bool // Frozen memory snapshots awaiting durable seal.
+	persistLocks   keyedMutex
+	ownedDevice    map[string]string
+	unattached     map[string]bool // Objects created here and not yet attached; guarded by devMu.
+	nameLocks      keyedMutex
+	restoreLocks   keyedMutex
+	bindings       map[string]hybridDeviceIdentity
+	readDevice     func(string) (hybridDeviceIdentity, error)
+	discovery      singleflight.Group
+	cloneOnce      sync.Once
+	cloneSlots     chan struct{}
 }
 
-// keyedMutex serializes work per key (one CoW object name) without blocking
-// unrelated keys. The entry is dropped when its last holder releases, so a
+// keyedMutex serializes mutations per key (one CoW object name), while
+// permitting shared readers of immutable template memory. The entry is dropped when its last holder releases, so a
 // long-lived Cubelet does not accumulate one mutex per volume ever seen.
 type keyedMutex struct {
 	mu    sync.Mutex
@@ -79,12 +90,15 @@ type keyedMutex struct {
 }
 
 type keyedMutexEntry struct {
-	mu   sync.Mutex
+	mu   sync.RWMutex
 	refs int
 }
 
 // lock acquires the mutex for name and returns its release function.
-func (k *keyedMutex) lock(name string) func() {
+func (k *keyedMutex) lock(name string) func()  { return k.acquire(name, false) }
+func (k *keyedMutex) rlock(name string) func() { return k.acquire(name, true) }
+
+func (k *keyedMutex) acquire(name string, shared bool) func() {
 	k.mu.Lock()
 	if k.locks == nil {
 		k.locks = make(map[string]*keyedMutexEntry)
@@ -97,9 +111,17 @@ func (k *keyedMutex) lock(name string) func() {
 	entry.refs++
 	k.mu.Unlock()
 
-	entry.mu.Lock()
+	if shared {
+		entry.mu.RLock()
+	} else {
+		entry.mu.Lock()
+	}
 	return func() {
-		entry.mu.Unlock()
+		if shared {
+			entry.mu.RUnlock()
+		} else {
+			entry.mu.Unlock()
+		}
 		k.mu.Lock()
 		entry.refs--
 		if entry.refs == 0 {
@@ -177,7 +199,14 @@ func (s *HybridStore) command(ctx context.Context, args ...string) ([]byte, erro
 		runCtx, cancel = context.WithTimeout(ctx, s.timeout)
 	}
 	defer cancel()
+	started := time.Now()
 	out, err := s.run(runCtx, s.cubestorCLIPath, args...)
+	if path := os.Getenv("CUBE_HYBRID_COMMAND_TRACE"); path != "" {
+		if f, openErr := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600); openErr == nil {
+			fmt.Fprintf(f, "%s duration_us=%d error=%t args=%q\n", started.Format(time.RFC3339Nano), time.Since(started).Microseconds(), err != nil, args)
+			f.Close()
+		}
+	}
 	if err != nil {
 		message := strings.TrimSpace(string(out))
 		if message == "" {
@@ -260,27 +289,75 @@ func (s *HybridStore) clone(ctx context.Context, source, destination, kind strin
 	if err := validateHybridKind(kind); err != nil {
 		return nil, err
 	}
-	// Lock both names in a deterministic order. Cloning into a name while
-	// another goroutine clones out of it (or deletes it) must not interleave,
-	// and an unordered pair of locks would deadlock.
+	// Template memory and completed snapshot packages are immutable. Live sandbox
+	// sources retain their exclusive lock and caller-provided freeze protocol.
+	// A missing local side must be materialized exclusively before it can be
+	// shared; do not attempt an RWMutex upgrade while holding destination locks.
+	sharedSource := ((strings.HasPrefix(source, "tpl-tpl-") && strings.HasSuffix(source, "-memory")) ||
+		(strings.HasPrefix(source, "tpl-snap-") && (strings.HasSuffix(source, "-memory") || strings.HasSuffix(source, "-rootfs")))) && source != destination
+	if _, err := os.Stat(filepath.Join(s.localDir, source)); err != nil {
+		sharedSource = false
+	}
+	if sharedSource {
+		s.cloneOnce.Do(func() { s.cloneSlots = make(chan struct{}, 4) })
+		select {
+		case s.cloneSlots <- struct{}{}:
+			defer func() { <-s.cloneSlots }()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	lockName := func(name string) func() {
+		if sharedSource && name == source {
+			return s.nameLocks.rlock(name)
+		}
+		return s.nameLocks.lock(name)
+	}
+	// Acquire both names in lexical order, regardless of reader/writer mode.
 	first, second := source, destination
 	if first > second {
 		first, second = second, first
 	}
-	unlockFirst := s.nameLocks.lock(first)
+	unlockFirst := lockName(first)
 	defer unlockFirst()
 	if second != first {
-		unlockSecond := s.nameLocks.lock(second)
+		unlockSecond := lockName(second)
 		defer unlockSecond()
 	}
+	// Delete may have won between the optimistic stat and acquiring the read
+	// lock. Never materialize or attach a source under a shared lock.
+	if sharedSource {
+		if _, err := os.Stat(filepath.Join(s.localDir, source)); err != nil {
+			return nil, err
+		}
+	}
 	if _, err := os.Stat(filepath.Join(s.localDir, source)); errors.Is(err, os.ErrNotExist) {
+		s.devMu.Lock()
+		delete(s.sealed, source)
+		delete(s.pendingPersist, source)
+		s.devMu.Unlock()
 		if _, resolveErr := s.attachLocked(ctx, source); resolveErr != nil {
 			return nil, fmt.Errorf("materialize hybrid source %s: %w", source, resolveErr)
 		}
 	} else if err != nil {
 		return nil, err
 	}
-	device, err := s.findDevice(ctx, source)
+	if sharedSource && strings.HasPrefix(source, "tpl-snap-") {
+		sealUnlock := s.restoreLocks.lock(source)
+		err := s.ensureSealed(ctx, source)
+		sealUnlock()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := s.syncPageCache(ctx, source); err != nil {
+		return nil, err
+	}
+	device := ""
+	var err error
+	if !s.isSealed(source) {
+		device, err = s.findDevice(ctx, source)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("find hybrid source device %s: %w", source, err)
 	}
@@ -289,18 +366,37 @@ func (s *HybridStore) clone(ctx context.Context, source, destination, kind strin
 			return nil, err
 		}
 	}
-	if _, err := s.command(ctx, "clone", "--local-dir", s.localDir,
-		"--shared-dir", s.sharedDir, source, destination); err != nil {
+	out, err := s.command(ctx, "clone", "--local-dir", s.localDir,
+		"--shared-dir", s.sharedDir, source, destination)
+	if err != nil {
 		if strings.Contains(err.Error(), "already exists") {
 			return nil, fmt.Errorf("%w: name=%s kind=%s", ErrCowObjectAlreadyExists, destination, kind)
 		}
 		return nil, err
 	}
-	size, err := s.GetSizeBytes(ctx, destination)
+	// New CLIs return the size already read while cloning. Keep compatibility
+	// with older CLIs, without paying for a second process in the normal path.
+	var size uint64
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "size" {
+			size, err = strconv.ParseUint(fields[1], 10, 64)
+			break
+		}
+	}
+	if size == 0 && err == nil {
+		size, err = s.GetSizeBytes(ctx, destination)
+	}
 	if err != nil {
 		cleanupErr := s.deleteLocked(context.Background(), destination)
 		return nil, errors.Join(err, cleanupErr)
 	}
+	s.devMu.Lock()
+	if s.unattached == nil {
+		s.unattached = make(map[string]bool)
+	}
+	s.unattached[destination] = true
+	s.devMu.Unlock()
 	return newCowVolumeWithSize(destination, kind, 0, "", size), nil
 }
 
@@ -513,11 +609,37 @@ func (s *HybridStore) CloneSandboxMemory(ctx context.Context, sandboxID, sourceN
 }
 
 func (s *HybridStore) findDevice(ctx context.Context, name string) (string, error) {
-	devices, err := s.listDevices(ctx)
-	if err != nil {
-		return "", err
+	s.devMu.Lock()
+	device := s.ownedDevice[name]
+	unattached := s.unattached[name]
+	expected, cached := s.bindings[name]
+	s.devMu.Unlock()
+	if unattached {
+		return "", nil
 	}
-	return devices[name], nil
+	if cached && device != "" {
+		actual, err := s.deviceIdentity(device)
+		if err == nil && actual == expected && actual.Name == name && actual.Socket == s.socketPath {
+			return device, nil
+		}
+		s.forgetDevice(name)
+	}
+	// Share overlapping discovery calls only; do not retain negative results
+	// across later attaches or an external worker restart.
+	result := s.discovery.DoChan("devices", func() (any, error) { return s.listDevices(ctx) })
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case r := <-result:
+		if r.Err != nil {
+			return "", r.Err
+		}
+		device = r.Val.(map[string]string)[name]
+		if device != "" {
+			s.rememberDevice(name, device)
+		}
+		return device, nil
+	}
 }
 
 func (s *HybridStore) listDevices(ctx context.Context) (map[string]string, error) {
@@ -533,13 +655,20 @@ func (s *HybridStore) listDevices(ctx context.Context) (map[string]string, error
 		}
 		foundName := ""
 		plugin := ""
+		socket := ""
 		for i := 1; i+1 < len(fields); i++ {
 			if fields[i] == "name" {
 				foundName = fields[i+1]
 			}
+			if fields[i] == "socket" {
+				socket = fields[i+1]
+			}
 			if fields[i] == "plugin" {
 				plugin = fields[i+1]
 			}
+		}
+		if socket != "" && socket != s.socketPath {
+			continue
 		}
 		if foundName == "" || plugin != "cubestor" || !strings.HasPrefix(fields[0], "nbd") {
 			continue
@@ -547,6 +676,121 @@ func (s *HybridStore) listDevices(ctx context.Context) (map[string]string, error
 		devices[foundName] = filepath.Join("/dev", fields[0])
 	}
 	return devices, nil
+}
+
+// ResolveSnapshotMemory reuses captured memory and finalizes legacy or cold copies.
+// A shared lifecycle lock permits background publication during attachment and
+// reads; a separate lock still prevents duplicate attachments of one export.
+func (s *HybridStore) ResolveSnapshotMemory(ctx context.Context, name, kind string) (string, error) {
+	if err := validateHybridName(name); err != nil {
+		return "", err
+	}
+	if err := validateHybridKind(kind); err != nil {
+		return "", err
+	}
+	unlock := s.nameLocks.rlock(name)
+	defer unlock()
+	restoreUnlock := s.restoreLocks.lock(name)
+	defer restoreUnlock()
+	if _, err := os.Stat(filepath.Join(s.localDir, name)); errors.Is(err, os.ErrNotExist) {
+		s.devMu.Lock()
+		delete(s.sealed, name)
+		delete(s.pendingPersist, name)
+		s.devMu.Unlock()
+		// A remote-only package needs a local overlay. Keep this attachment
+		// through the online seal instead of disconnecting and attaching again.
+		if _, err := s.attachLocked(ctx, name); err != nil {
+			return "", err
+		}
+	} else if err != nil {
+		return "", err
+	}
+	if err := s.ensureSealed(ctx, name); err != nil {
+		return "", err
+	}
+	return s.attachLocked(ctx, name)
+}
+
+func (s *HybridStore) isSealed(name string) bool {
+	s.devMu.Lock()
+	defer s.devMu.Unlock()
+	return s.sealed[name]
+}
+
+func (s *HybridStore) rememberSealed(name string) {
+	s.devMu.Lock()
+	defer s.devMu.Unlock()
+	if s.sealed == nil {
+		s.sealed = make(map[string]bool)
+	}
+	s.sealed[name] = true
+}
+
+// Persistence has its own lock: restores must not wait for the publisher's
+// file barriers just to discover/reuse the retained block device.
+func (s *HybridStore) syncPageCache(ctx context.Context, name string) error {
+	unlock := s.persistLocks.lock(name)
+	defer unlock()
+	s.devMu.Lock()
+	pending := s.pendingPersist[name]
+	s.devMu.Unlock()
+	if !pending {
+		if _, err := os.Stat(filepath.Join(s.localDir, ".pending", name)); errors.Is(err, os.ErrNotExist) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+	}
+	if _, err := s.command(ctx, "flush", "--sync-page-cache", "--unix", s.socketPath, "--name", name); err != nil {
+		return err
+	}
+	s.devMu.Lock()
+	delete(s.pendingPersist, name)
+	s.devMu.Unlock()
+	return nil
+}
+
+// Caller holds the lifecycle lock and, for shared readers, restoreLocks.
+// Normal captures populate sealed before returning. Only legacy packages or
+// a new process need the header check and compatibility transition.
+func (s *HybridStore) ensureSealed(ctx context.Context, name string) error {
+	if s.isSealed(name) {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(s.localDir, ".pending", name)); err == nil {
+		if err := s.syncPageCache(ctx, name); err != nil {
+			return err
+		}
+		s.rememberSealed(name)
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	out, err := s.command(ctx, "info", "--header-only", "--dir", s.localDir, "--name", name)
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "flags ") && strings.Contains(" "+line+" ", " sealed ") {
+			s.rememberSealed(name)
+			return nil
+		}
+	}
+	// Offline sealing avoids enumeration for freshly cloned, unattached rootfs.
+	_, err = s.command(ctx, "seal", "--dir", s.localDir, "--name", name)
+	if err != nil && isHybridObjectBusy(err) {
+		device, findErr := s.findDevice(ctx, name)
+		if findErr != nil {
+			return findErr
+		}
+		if device != "" {
+			_, err = s.command(ctx, "seal", "--unix", s.socketPath, "--device", device, "--name", name)
+		}
+	}
+	if err == nil {
+		s.rememberSealed(name)
+	}
+	return err
 }
 
 func (s *HybridStore) ResolveDevPath(ctx context.Context, name, kind string) (string, error) {
@@ -575,6 +819,10 @@ func (s *HybridStore) attachLocked(ctx context.Context, name string) (string, er
 		}
 		return device, err
 	}
+	// Once attach is attempted, rediscover on failure: a worker may exist.
+	s.devMu.Lock()
+	delete(s.unattached, name)
+	s.devMu.Unlock()
 	out, err := s.command(ctx, "attach", "--unix", s.socketPath, "--name", name)
 	if err != nil {
 		return "", err
@@ -601,7 +849,7 @@ func (s *HybridStore) attachLocked(ctx context.Context, name string) (string, er
 		return "", fmt.Errorf("cubestorcli attach %s returned invalid device %q", name, device)
 	}
 	if err := s.validateObjectPair(name); err != nil {
-		_, detachErr := s.command(context.Background(), "detach", "--device", device)
+		_, detachErr := s.detachDevice(context.Background(), name, device)
 		return "", errors.Join(fmt.Errorf("validate attached hybrid object %s: %w", name, err), detachErr)
 	}
 	s.rememberDevice(name, device)
@@ -624,17 +872,29 @@ func (s *HybridStore) validateObjectPair(name string) error {
 // rememberDevice records our ownership of an attachment. devMu only guards the
 // map; it is never held across a subprocess call.
 func (s *HybridStore) rememberDevice(name, device string) {
+	identity, identityErr := s.deviceIdentity(device)
 	s.devMu.Lock()
 	if s.ownedDevice == nil {
 		s.ownedDevice = make(map[string]string)
 	}
+	delete(s.unattached, name)
 	s.ownedDevice[name] = device
+	if identityErr == nil && identity.Name == name && identity.Socket == s.socketPath {
+		if s.bindings == nil {
+			s.bindings = make(map[string]hybridDeviceIdentity)
+		}
+		s.bindings[name] = identity
+	} else {
+		delete(s.bindings, name)
+	}
 	s.devMu.Unlock()
 }
 
 func (s *HybridStore) forgetDevice(name string) {
 	s.devMu.Lock()
+	delete(s.unattached, name)
 	delete(s.ownedDevice, name)
+	delete(s.bindings, name)
 	s.devMu.Unlock()
 }
 
@@ -657,6 +917,16 @@ func (s *HybridStore) DeactivateByKind(ctx context.Context, name, kind string) e
 	// and holding the name lock would block every other operation on this
 	// object for its duration.
 	unlock := s.nameLocks.lock(name)
+	if strings.HasPrefix(name, "tpl-snap-") {
+		var err error
+		if strings.HasSuffix(name, "-memory") {
+			err = s.freezeSnapshotMemoryLocked(ctx, name)
+		} else {
+			err = s.ensureSealed(ctx, name)
+		}
+		unlock()
+		return err
+	}
 	err := s.deactivateLocked(ctx, name)
 	unlock()
 	if err != nil {
@@ -669,17 +939,10 @@ func (s *HybridStore) DeactivateByKind(ctx context.Context, name, kind string) e
 	return nil
 }
 
-// BeginSnapshotDeactivate flushes a completed snapshot synchronously, then
-// releases its NBD device in the background. The per-name lock is deliberately
-// transferred to the detach goroutine: publish, delete, and a later attach all
-// block until the export is released.
-//
-// The flush stays on the request path on purpose. The detach runs in the
-// background, and the plugin's own close-time flush_locked discards its error,
-// so without this the RPC would return while the snapshot's dirty pages only
-// existed in nbdkit's memory: a Cubelet restart in that window would lose them.
-// This flush is the durability point for the snapshot; the later close-time
-// flush then finds nothing dirty.
+// BeginSnapshotDeactivate finalizes captured memory while retaining the NBD
+// attachment and its cached pages. Durability is completed by the publisher.
+// The historical interface name also covers
+// backends that release devices; Hybrid now seals the live export instead.
 func (s *HybridStore) BeginSnapshotDeactivate(ctx context.Context, name, kind string) error {
 	if err := validateHybridName(name); err != nil {
 		return err
@@ -688,92 +951,53 @@ func (s *HybridStore) BeginSnapshotDeactivate(ctx context.Context, name, kind st
 		return err
 	}
 	unlock := s.nameLocks.lock(name)
+	defer unlock()
+	return s.freezeSnapshotMemoryLocked(ctx, name)
+}
+
+func (s *HybridStore) freezeSnapshotMemoryLocked(ctx context.Context, name string) error {
+	if s.isSealed(name) {
+		return nil
+	}
 	device, err := s.findDevice(ctx, name)
 	if err != nil {
-		unlock()
 		return err
 	}
 	if device == "" {
-		unlock()
-		return nil
+		return s.ensureSealed(ctx, name)
 	}
 	if !s.ownsDevice(name) {
 		if err := s.validateObjectPair(name); err != nil {
-			unlock()
-			return fmt.Errorf("refuse to deactivate unowned hybrid device %s for %s: %w", device, name, err)
+			return err
 		}
 	}
-	if _, err := s.command(ctx, "flush", "--device", device); err != nil {
-		unlock()
+	if _, err := s.command(ctx, "flush", "--to-page-cache", "--unix", s.socketPath, "--device", device, "--name", name); err != nil {
 		return err
 	}
-
-	detachCtx := context.WithoutCancel(ctx)
-	go func() {
-		defer unlock()
-		if _, err := s.command(detachCtx, "detach", "--device", device); err != nil {
-			log.G(detachCtx).Warnf("background hybrid snapshot detach failed: name=%s device=%s: %v", name, device, err)
-			return
-		}
-		s.forgetDevice(name)
-	}()
+	s.devMu.Lock()
+	if s.pendingPersist == nil {
+		s.pendingPersist = make(map[string]bool)
+	}
+	s.pendingPersist[name] = true
+	s.devMu.Unlock()
+	s.rememberSealed(name)
 	return nil
 }
 
-// publishVolume merges one volume from the local overlay into the shared image.
-//
-// This only ever receives a snapshot's OWN volumes (tpl-snap-<id>-rootfs and
-// -memory, resolved from the package catalog). The source volumes the running VM
-// is using -- its sb-<id>-rootfs-genN and the template's tpl-<id>-memory -- are
-// never passed here, so publishing cannot disturb a live sandbox.
-//
-// cubestorcli sync takes an exclusive flock on the local image, so it cannot run
-// while any export is attached. That is the correct answer, not a race to
-// schedule around: sync also rewrites the local map and header, which would
-// fight the plugin's in-memory copy on the next close. A busy object is reported
-// as [errHybridPublishBusy] and UploadStatus leaves remote_status in progress,
-// so the publish simply retries once the consumer is gone.
-//
-// Nothing here detaches. Detaching used to look harmless because the snapshot
-// path detaches its own clones before publishing, but the same object NAME is
-// what a restore attaches: tpl-snap-<id>-memory is resolved from the package
-// catalog and attached by ResolveDevPath milliseconds before the shim opens the
-// device to mmap it. A publisher that detached whatever findDevice returned
-// therefore killed the export a restore was about to map, which surfaces as
-// GuestMemoryRegion(MappingPastEof) because the freshly opened device reports
-// size 0.
-//
-// The volume is deliberately NOT re-attached afterwards: the published content
-// lives in the shared image, and leaving an export attached would race the
-// delete/GC path that is entitled to remove the volume once the caller stops
-// using it (observed as "cubestorcli delete ... is in use").
+// publishVolume persists frozen memory before uploading immutable package
+// volumes. Legacy objects are finalized once on first use.
+// Publication then reads stable local pages under a shared lock, without
+// changing the mounted overlay or waiting for consumers to detach.
 func (s *HybridStore) publishVolume(ctx context.Context, name string) error {
 	if err := validateHybridName(name); err != nil {
 		return err
 	}
-	unlock := s.nameLocks.lock(name)
+	unlock := s.nameLocks.rlock(name)
 	defer unlock()
-	if device, findErr := s.findDevice(ctx, name); findErr != nil {
-		return fmt.Errorf("find hybrid device %s before publish: %w", name, findErr)
-	} else if device != "" {
-		// Someone is using this object right now -- most often a restore that
-		// attached it to map guest memory. The overlay lock sync needs is held,
-		// so back off instead of guessing whether it is safe to wait.
-		return fmt.Errorf("%w: %s is attached as %s", errHybridPublishBusy, name, device)
-	}
-
-	// Nothing to merge when the overlay already records itself as synced.
-	if synced, err := s.volumeSynced(ctx, name); err == nil && synced {
-		return nil
-	}
-
-	// Keep the per-name lock through the merge. Locks for other objects remain
-	// independent, while attach/delete of this object must not race publication.
-	if err := s.syncToShared(ctx, name); err != nil {
-		// The package may have been deleted while we were merging. Delete now
-		// refuses while remote_status is unsettled, so this is limited to TTL
-		// expiry and operator cleanup of a FAILED row; nothing is left to
-		// publish either way.
+	sealUnlock := s.restoreLocks.lock(name)
+	sealErr := s.ensureSealed(ctx, name)
+	sealUnlock()
+	if err := sealErr; err != nil {
 		if snapshotGoneFromLocal(s.localDir, name) {
 			return nil
 		}
@@ -782,7 +1006,17 @@ func (s *HybridStore) publishVolume(ctx context.Context, name string) error {
 		}
 		return err
 	}
-	return nil
+	if err := s.syncPageCache(ctx, name); err != nil {
+		return err
+	}
+	_, err := s.command(ctx, "sync", "--immutable", "--local-dir", s.localDir, "--shared-dir", s.sharedDir, "--name", name)
+	if err != nil && snapshotGoneFromLocal(s.localDir, name) {
+		return nil
+	}
+	if isHybridObjectBusy(err) {
+		return fmt.Errorf("%w: %s: %v", errHybridPublishBusy, name, err)
+	}
+	return err
 }
 
 // snapshotGoneFromLocal reports whether the local overlay no longer exists,
@@ -811,7 +1045,7 @@ func (s *HybridStore) volumeSynced(ctx context.Context, name string) (bool, erro
 	if err := validateHybridName(name); err != nil {
 		return false, err
 	}
-	out, err := s.command(ctx, "info", "--dir", s.localDir, "--name", name)
+	out, err := s.command(ctx, "info", "--header-only", "--dir", s.localDir, "--name", name)
 	if err != nil {
 		return false, err
 	}
@@ -851,7 +1085,7 @@ func (s *HybridStore) deactivateLocked(ctx context.Context, name string) error {
 	if _, err := s.command(ctx, "flush", "--device", device); err != nil {
 		return err
 	}
-	if _, err := s.command(ctx, "detach", "--device", device); err != nil {
+	if _, err := s.detachDevice(ctx, name, device); err != nil {
 		return err
 	}
 	s.forgetDevice(name)
@@ -883,10 +1117,22 @@ func (s *HybridStore) deleteLocked(ctx context.Context, name string) error {
 		}
 	}
 	if len(args) == 1 {
+		s.devMu.Lock()
+		delete(s.sealed, name)
+		delete(s.pendingPersist, name)
+		s.devMu.Unlock()
+		s.forgetDevice(name)
 		return nil
 	}
 	args = append(args, "--name", name)
 	_, err := s.command(ctx, args...)
+	if err == nil {
+		s.devMu.Lock()
+		delete(s.sealed, name)
+		delete(s.pendingPersist, name)
+		s.devMu.Unlock()
+		s.forgetDevice(name)
+	}
 	return err
 }
 
@@ -1005,6 +1251,13 @@ func (s *HybridStore) Close(ctx context.Context) error {
 			unlock()
 			continue
 		}
+		// Validate this exact worker rather than enumerating other devices.
+		actual, identityErr := s.deviceIdentity(device)
+		if identityErr != nil || actual.Name != name || actual.Socket != s.socketPath {
+			closeErr = errors.Join(closeErr, fmt.Errorf("cannot verify owned device %s for %s: %v", device, name, identityErr))
+			unlock()
+			continue
+		}
 		// Flush before detach for the same reason as deactivateLocked: detach
 		// only disconnects, which discards whatever is still in the page cache.
 		if _, err := s.command(ctx, "flush", "--device", device); err != nil {
@@ -1012,7 +1265,7 @@ func (s *HybridStore) Close(ctx context.Context) error {
 			unlock()
 			continue
 		}
-		if _, err := s.command(ctx, "detach", "--device", device); err != nil {
+		if _, err := s.detachDevice(ctx, name, device); err != nil {
 			closeErr = errors.Join(closeErr, fmt.Errorf("detach hybrid object %s: %w", name, err))
 			unlock()
 			continue

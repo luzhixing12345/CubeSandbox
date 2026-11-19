@@ -554,7 +554,7 @@ func TestCommitSnapshotDestinationRejectsExistingPackage(t *testing.T) {
 			return nil, dbErr
 		})
 	require.ErrorIs(t, err, dbErr)
-	for _, backend := range []string{"", "xfs", "jfs", "juicefs"} {
+	for _, backend := range []string{"", "xfs", "jfs", "juicefs", "hybrid"} {
 		t.Run("skip_"+backend, func(t *testing.T) {
 			inspected := false
 			require.NoError(t, checkCommitSnapshotDestination(context.Background(), backend, "new",
