@@ -212,6 +212,13 @@ func (h *localCubeRunTemplateManager) EnsureCubeRunTemplate(ctx context.Context,
 		return nil, err
 	}
 	if cloned != nil {
+		if normalized, _ := cow.NormalizeBackend(backend); normalized == cow.BackendHybrid {
+			entry, err := storage.GetLocalSnapshotFor(ctx, normalized, templateID)
+			if err != nil {
+				return nil, err
+			}
+			cloned.Snapshot.Snapshot.Path = entry.MetaDir
+		}
 		return cloned, nil
 	}
 	backend, err = cow.NormalizeBackend(backend)
@@ -385,6 +392,29 @@ func metadataHomeConfigPath(home string) string {
 }
 
 func (h *localCubeRunTemplateManager) recoverBackendMetadataHomes(ctx context.Context, backend, media, templateID string) error {
+	if backend == cow.BackendHybrid {
+		// Catalog discovery validates publication and prefers the local copy.
+		var entries []*storage.SnapshotCatalogEntry
+		if templateID != "" {
+			entry, err := storage.GetLocalSnapshotFor(ctx, backend, templateID)
+			if err != nil {
+				return err
+			}
+			entries = append(entries, entry)
+		} else {
+			var err error
+			entries, err = storage.ListLocalSnapshotsFor(ctx, backend)
+			if err != nil {
+				return err
+			}
+		}
+		for _, entry := range entries {
+			if err := h.recoverMetadataHomes(ctx, filepath.Dir(entry.SnapshotPath), media, entry.SnapshotID); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	var first error
 	for _, kind := range []string{storage.SnapshotKindNormal, storage.SnapshotKindPause} {
 		if err := h.recoverMetadataHomes(ctx, recoverySnapshotKindRoot(backend, kind), media, templateID); err != nil && first == nil {

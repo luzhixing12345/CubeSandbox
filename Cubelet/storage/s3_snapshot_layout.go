@@ -86,17 +86,14 @@ func backendDirName(backend string) string {
 // BackendStorageRoot is <work>/xfs or <work>/s3, and [JFSStorageRoot] on the
 // JuiceFS mount for jfs.
 //
-// Hybrid keeps its package metadata next to its shared baseline instead: the
-// template catalog, sandbox spec and hypervisor state must be readable from
-// every node, exactly like jfs. Its local XFS directory holds only the overlay
-// page maps, so metadata under <work>/hybrid would strand every template on the
-// node that built it.
+// Hybrid captures package metadata on local XFS, then publishes an atomic
+// shared copy. Catalog lookup prefers local packages and falls back to shared.
 func BackendStorageRoot(backend string) string {
 	if isJFSBackend(backend) {
 		return JFSStorageRoot()
 	}
 	if isHybridBackend(backend) {
-		return HybridStorageRoot()
+		return HybridLocalStorageRoot()
 	}
 	return filepath.Join(CubeletStorageWorkPath(), backendDirName(backend))
 }
@@ -111,6 +108,10 @@ func SnapshotHome(backend, kind, snapshotID string) string {
 	snapshotID = strings.TrimSpace(snapshotID)
 	if snapshotID == "" {
 		return ""
+	}
+	// Template builds already publish synchronously; retain their shared layout.
+	if isHybridBackend(backend) && strings.HasPrefix(snapshotID, "tpl-") {
+		return filepath.Join(HybridStorageRoot(), normalizeSnapshotKind(kind), snapshotID)
 	}
 	return filepath.Join(SnapshotKindRoot(backend, kind), snapshotID)
 }
@@ -189,10 +190,14 @@ func IsS3Backend(backend string) bool {
 }
 
 func catalogKindRoots(backend string) []string {
-	return []string{
+	roots := []string{
 		SnapshotKindRoot(backend, SnapshotKindNormal),
 		SnapshotKindRoot(backend, SnapshotKindPause),
 	}
+	if isHybridBackend(backend) {
+		roots = append(roots, filepath.Join(HybridStorageRoot(), SnapshotKindNormal), filepath.Join(HybridStorageRoot(), SnapshotKindPause))
+	}
+	return roots
 }
 
 // EnsureShimSpecDirLink exposes <home>/<specDir> for the installed shim, which

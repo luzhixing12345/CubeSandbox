@@ -134,7 +134,7 @@ func (p *hybridPublisher) publish(ctx context.Context, snapshotID string) error 
 			"volume":      name,
 		}).Infof("hybrid publish: %s is in the shared image", name)
 	}
-	return nil
+	return publishHybridMetadata(ctx, snapshotID)
 }
 
 // UploadStatus reports the merge progress for Master's remote_status poller.
@@ -212,7 +212,7 @@ func (p *hybridPublisher) alreadyPublished(ctx context.Context, snapshotID strin
 			return false, nil
 		}
 	}
-	return true, nil
+	return hybridMetadataPublished(ctx, snapshotID)
 }
 
 // hybridPackageObjectNames returns the data volumes a hybrid snapshot package

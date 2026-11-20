@@ -83,6 +83,9 @@ func prepareSnapshotWorkLayout(backend, kind, snapshotID, requestedDir, specDir 
 	}
 	_ = specDir
 	kindRoot := snapshotKindDirForRequest(normalized, kind, requestedDir)
+	if normalized == cow.BackendHybrid && strings.HasPrefix(snapshotID, "tpl-") {
+		kindRoot = filepath.Dir(storage.SnapshotHome(normalized, kind, snapshotID))
+	}
 	home := filepath.Join(kindRoot, snapshotID)
 	tmpHome := home + ".tmp"
 	layout := snapshotWorkLayout{

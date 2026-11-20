@@ -72,6 +72,7 @@ func runCheckpointFixture(t *testing.T, backend, failure string) error {
 		}
 		return &cubebox.CommitSandboxResponse{Ret: &ec.Ret{RetCode: ec.ErrorCode_Success}, SnapshotPath: "/snapshot", RemoteUuids: uuids}, nil
 	})
+	patchSnapshotCompletionForTest(p)
 	p.ApplyFunc(UpsertReplica, func(context.Context, string, string, ReplicaStatus) error {
 		if failure == "replica" {
 			return errors.New("replica")

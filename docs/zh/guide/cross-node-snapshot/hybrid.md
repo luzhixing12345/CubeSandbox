@@ -320,3 +320,19 @@ writeback；普通 JFS 后端的配置不受影响。
 修改运行中节点的配置需要重挂载，不能只修改 `.one-click.env`。应先停止新调度，
 确认无存活沙箱、无待持久化内存且 JuiceFS staging 已上传完，再停止 Cubelet、
 断开空闲导出、重启 Hybrid 服务及 Cubelet。不要删除 staging 数据。
+
+### 运行时快照元数据的本地提交
+
+新制作的运行时快照（含暂停包）先将 `config.json`、`state.json`、
+`metadata.json` 和 catalog 等元数据写入本地
+`<storage-work>/hybrid/packages/{snapshots,pause-snapshots}/<id>`，完成必要的
+文件与目录同步后返回。同节点恢复优先使用该包；旧快照或本地元数据不存在时，
+回退到 JuiceFS 上原有的 `hybrid/{snapshots,pause-snapshots}/<id>`。
+模板构建仍沿用共享目录布局。
+
+后台发布先完成内存/rootfs 数据上传，再将元数据复制到 JuiceFS 临时目录，
+同步文件和目录，最后原子重命名为共享包。只有数据与元数据均完成发布才报告
+`remote_status=ready`。新格式 catalog 的 `hybrid_metadata_version=1` 和包内
+`.metadata-published` 标记用于区分完整发布与暂存目录；旧格式保持兼容。
+共享 catalog 保存共享路径，因此未升级的节点也能读取完成发布的新快照。
+删除时等待本进程的发布任务结束，再清理数据对象和本地、共享两份元数据。

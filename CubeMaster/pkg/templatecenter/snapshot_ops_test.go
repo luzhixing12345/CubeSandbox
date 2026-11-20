@@ -552,6 +552,7 @@ func TestRunSnapshotCreateJobWritesThinReplica(t *testing.T) {
 	patches.ApplyFunc(cubelet.GetCubeletAddr, func(hostIP string) string {
 		return hostIP
 	})
+	patchSnapshotCompletionForTest(patches)
 	patches.ApplyFunc(UpsertReplica, func(ctx context.Context, templateID, instanceType string, replica ReplicaStatus) error {
 		upsertCalled = true
 		upserted = replica
@@ -633,6 +634,7 @@ func TestRunSnapshotCreateJobPersistsS3RemoteUUIDs(t *testing.T) {
 	patches.ApplyFunc(getTemplateImageJobRecordByID, func(ctx context.Context, jobID string) (*models.TemplateImageJob, error) {
 		return nil, gorm.ErrRecordNotFound
 	})
+	patchSnapshotCompletionForTest(patches)
 	patches.ApplyFunc(UpsertReplica, func(ctx context.Context, templateID, instanceType string, replica ReplicaStatus) error {
 		return nil
 	})
@@ -684,6 +686,7 @@ func TestRunSnapshotCreateJobEmptyRemoteUUIDsMarksFailedNotJobError(t *testing.T
 	patches.ApplyFunc(getTemplateImageJobRecordByID, func(ctx context.Context, jobID string) (*models.TemplateImageJob, error) {
 		return nil, gorm.ErrRecordNotFound
 	})
+	patchSnapshotCompletionForTest(patches)
 	patches.ApplyFunc(UpsertReplica, func(ctx context.Context, templateID, instanceType string, replica ReplicaStatus) error {
 		return nil
 	})
@@ -754,6 +757,7 @@ func TestRunSnapshotCreateJobAnchorsTTLExpiryAtReady(t *testing.T) {
 	patches.ApplyFunc(getTemplateImageJobRecordByID, func(ctx context.Context, jobID string) (*models.TemplateImageJob, error) {
 		return &models.TemplateImageJob{JobID: jobID, RequestJSON: requestJSON}, nil
 	})
+	patchSnapshotCompletionForTest(patches)
 	patches.ApplyFunc(UpsertReplica, func(ctx context.Context, templateID, instanceType string, replica ReplicaStatus) error {
 		return nil
 	})

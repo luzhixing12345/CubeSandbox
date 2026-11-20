@@ -50,6 +50,7 @@ type pauseStageTimings struct {
 	RootfsCloneMS       float64 `json:"rootfs_clone_ms"`
 	SpecWriteMS         float64 `json:"spec_write_ms"`
 	RootfsSpecWallMS    float64 `json:"rootfs_spec_wall_ms"`
+	MemoryFreezeMS      float64 `json:"memory_freeze_ms"`
 	PackageFinalizeMS   float64 `json:"package_finalize_ms"`
 	DestroyLiveMS       float64 `json:"destroy_live_ms"`
 	CubeletTotalMS      float64 `json:"cubelet_total_ms"`
@@ -550,6 +551,14 @@ func (s *service) updateWithPauseCow(
 	specWriteStarted := time.Now()
 	specErr := writePauseSandboxSpec(layout.MetaWork, pauseSpec)
 	stageTimings.SpecWriteMS = durationMS(time.Since(specWriteStarted))
+	// Match CommitSandbox: after the guest is frozen, rootfs cloning and
+	// draining/sealing the independent memory device can run together.
+	// Always join rootfs before handling errors so cleanup cannot race it.
+	memoryFreezeStarted := time.Now()
+	memoryDeactivateStarted, memoryDeactivateErr := storage.BeginSnapshotDeactivateFor(
+		workCtx, backend, memoryObject.Name, memoryObject.Kind,
+	)
+	stageTimings.MemoryFreezeMS = durationMS(time.Since(memoryFreezeStarted))
 	rootfsResult := <-rootfsReady
 	stageTimings.RootfsCloneMS = durationMS(rootfsResult.duration)
 	stageTimings.RootfsSpecWallMS = durationMS(time.Since(rootfsSpecStarted))
@@ -563,12 +572,19 @@ func (s *service) updateWithPauseCow(
 			fmt.Sprintf("failed to create pause rootfs snapshot: %v", err))
 	}
 
+	if memoryDeactivateErr != nil {
+		return failPause(errorcode.ErrorCode_Unknown, fmt.Sprintf("failed to freeze pause memory: %v", memoryDeactivateErr))
+	}
 	if specErr != nil {
 		return failPause(errorcode.ErrorCode_Unknown, fmt.Sprintf("failed to write pause sandbox_spec: %v", specErr))
 	}
 	packageFinalizeStarted := time.Now()
 	// Do not write memory.dev — restore uses catalog vol name + ResolveDevPath.
-	if err := deactivateCowSnapshotObjectsOn(workCtx, stepLog, backend, memoryObject, rootfsObject); err != nil {
+	memoryToDeactivate := memoryObject
+	if memoryDeactivateStarted {
+		memoryToDeactivate = nil // already drained; unsupported backends use the fallback
+	}
+	if err := deactivateCowSnapshotObjectsOn(workCtx, stepLog, backend, memoryToDeactivate, rootfsObject); err != nil {
 		return failPause(errorcode.ErrorCode_Unknown, fmt.Sprintf("failed to deactivate pause snapshot objects: %v", err))
 	}
 	if layout.usesTmpRename() {

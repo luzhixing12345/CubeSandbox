@@ -2242,20 +2242,24 @@ func UpsertReplica(ctx context.Context, templateID, instanceType string, replica
 	if !isReady() {
 		return ErrTemplateStoreNotInitialized
 	}
+	return upsertReplicaTx(store.db.WithContext(ctx), templateID, instanceType, replica)
+}
+
+func upsertReplicaTx(tx *gorm.DB, templateID, instanceType string, replica ReplicaStatus) error {
 	record := &models.TemplateReplica{}
 	// Do not reuse the *gorm.DB chain after First on PostgreSQL: GORM may emit
 	// UPDATE ... FROM t_cube_template_replica (SQLSTATE 42712).
-	err := store.db.WithContext(ctx).Table(constants.TemplateReplicaTableName).
+	err := tx.Table(constants.TemplateReplicaTableName).
 		Where("template_id = ? AND node_id = ?", templateID, replica.NodeID).
 		First(record).Error
 	if err != nil {
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
-		return store.db.WithContext(ctx).Table(constants.TemplateReplicaTableName).
+		return tx.Table(constants.TemplateReplicaTableName).
 			Create(replicaStatusToModel(templateID, instanceType, replica)).Error
 	}
-	return store.db.WithContext(ctx).Table(constants.TemplateReplicaTableName).
+	return tx.Table(constants.TemplateReplicaTableName).
 		Where("template_id = ? AND node_id = ?", templateID, replica.NodeID).
 		Updates(replicaStatusUpdateFields(instanceType, replica)).Error
 }

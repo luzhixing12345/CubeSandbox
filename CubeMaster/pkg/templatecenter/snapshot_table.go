@@ -93,10 +93,10 @@ func createSnapshotTx(ctx context.Context, tx *gorm.DB, snapshotID string, store
 	}
 	rec.RootfsArtifactID = rootfsArtifactIDFromCreateRequest(storedReq)
 	if rec.RootfsArtifactID != "" {
-		// Serialize new references against last-owner cleanup. Once cleanup
-		// has started, its lock-free physical phase must not gain new owners.
+		// Concurrent new references may share this read lock. Last-owner cleanup
+		// still takes UPDATE, so its physical phase cannot gain new owners.
 		var artifact models.RootfsArtifact
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		if err := tx.Clauses(clause.Locking{Strength: "SHARE"}).
 			Where("artifact_id = ?", rec.RootfsArtifactID).First(&artifact).Error; err != nil {
 			return fmt.Errorf("snapshot rootfs artifact %s: %w", rec.RootfsArtifactID, err)
 		}

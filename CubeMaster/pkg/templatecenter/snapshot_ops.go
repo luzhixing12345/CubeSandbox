@@ -351,11 +351,7 @@ func runSnapshotCreateJob(ctx context.Context, jobID, sandboxID, nodeID, nodeIP 
 		"sandbox_id":  sandboxID,
 		"node_id":     nodeID,
 	})
-	_ = updateTemplateImageJob(ctx, jobID, map[string]any{
-		"status":   JobStatusRunning,
-		"phase":    JobPhaseSnapshotting,
-		"progress": 10,
-	})
+	// executeSnapshotCreateJob already durably claimed RUNNING/10.
 
 	commitBackend := storageBackendFromCreate(createReq)
 	// The snapshot record is written in the same transaction as this job, so a
@@ -415,13 +411,6 @@ func runSnapshotCreateJob(ctx context.Context, jobID, sandboxID, nodeID, nodeIP 
 	}
 
 	snapshotPath := commitRsp.GetSnapshotPath()
-	_ = updateTemplateImageJob(ctx, jobID, map[string]any{
-		"phase":         JobPhaseRegistering,
-		"progress":      70,
-		"node_id":       nodeID,
-		"node_ip":       nodeIP,
-		"snapshot_path": snapshotPath,
-	})
 
 	// Snapshot replicas only carry control-plane state from this point onward.
 	// Physical references (rootfs/memory vol/dev, meta_dir, snapshot path) live
@@ -437,19 +426,7 @@ func runSnapshotCreateJob(ctx context.Context, jobID, sandboxID, nodeID, nodeIP 
 		LastJobID:    jobID,
 	}
 	bindGuestVersionToReplica(&replica, commitRsp.GetGuestImageVersion(), commitRsp.GetAgentVersion(), commitRsp.GetKernelVersion(), commitRsp.GetShimVersion())
-	_ = updateTemplateImageJob(ctx, jobID, map[string]any{
-		"phase":    JobPhaseRegistering,
-		"progress": 85,
-	})
-	if err := UpsertReplica(ctx, snapshotID, createReq.InstanceType, replica); err != nil {
-		return failSnapshotCreateJob(ctx, jobID, snapshotID, nodeIP, snapshotPath, commitRsp, err, commitBackend)
-	}
-	setTemplateLocalityCache(snapshotID, []ReplicaStatus{replica})
-	registerTemplateReplicaForSnapshot(snapshotID, nodeID, 1)
 
-	if cacheErr := setTemplateRequestCache(snapshotID, storedReq); cacheErr != nil {
-		logger.Warnf("set snapshot request cache failed: %v", cacheErr)
-	}
 	snapUpdates := map[string]any{
 		"status":                        StatusReady,
 		"last_error":                    "",
@@ -482,19 +459,20 @@ func runSnapshotCreateJob(ctx context.Context, jobID, sandboxID, nodeID, nodeIP 
 			snapUpdates["remote_status"] = constants.RemoteStatusFailed
 		}
 	}
-	if err := updateSnapshotFields(ctx, snapshotID, snapUpdates); err != nil {
-		return failSnapshotCreateJob(ctx, jobID, snapshotID, nodeIP, snapshotPath, commitRsp, err, commitBackend)
-	}
-	if snapUpdates["remote_status"] == constants.RemoteStatusInProgress {
-		remotestatus.WatchSnapshot(ctx, snapshotID, nodeIP, commitBackend, exportUUIDs, mode)
-	}
-	// Commit yields a single authoritative envd version; persist it (best-effort)
-	// to the snapshot definition annotation so created sandboxes inherit it.
+	// Persist the version in the same completion transaction as READY rather
+	// than a second read-modify-write transaction after exposing the snapshot.
 	if envdVersion := sanitizeEnvdVersion(commitRsp.GetEnvdVersion()); envdVersion != "" {
-		if err := persistTemplateEnvdVersion(ctx, snapshotID, envdVersion); err != nil {
-			logger.Warnf("persist snapshot envd version fail, snapshot=%s err=%v", snapshotID, err)
+		if storedReq.Annotations == nil {
+			storedReq.Annotations = make(map[string]string)
 		}
+		storedReq.Annotations[constants.CubeAnnotationComponentEnvdVersion] = envdVersion
+		payload, marshalErr := json.Marshal(storedReq)
+		if marshalErr != nil {
+			return failSnapshotCreateJob(ctx, jobID, snapshotID, nodeIP, snapshotPath, commitRsp, marshalErr, commitBackend)
+		}
+		snapUpdates["request_json"] = string(payload)
 	}
+
 	resultPayload, _ := json.Marshal(map[string]any{
 		"snapshot_path":     snapshotPath,
 		"rootfs_vol":        commitRsp.GetRootfsVol(),
@@ -510,20 +488,49 @@ func runSnapshotCreateJob(ctx context.Context, jobID, sandboxID, nodeID, nodeIP 
 		"origin_node_id":    nodeID,
 		"display_name":      "",
 	})
-	if err := updateTemplateImageJob(ctx, jobID, map[string]any{
+	if err := completeSnapshotCreate(ctx, snapshotID, createReq.InstanceType, replica, snapUpdates, jobID, map[string]any{
 		"status":          JobStatusReady,
+		"node_id":         nodeID,
+		"node_ip":         nodeIP,
+		"snapshot_path":   snapshotPath,
 		"phase":           JobPhaseRegistering,
 		"progress":        100,
 		"template_status": StatusReady,
 		"result_json":     string(resultPayload),
 		"error_message":   "",
 	}); err != nil {
-		return err
+		return failSnapshotCreateJob(ctx, jobID, snapshotID, nodeIP, snapshotPath, commitRsp, err, commitBackend)
+	}
+	// Publish caches and start readiness polling only after all database state
+	// commits atomically. A failure must never expose a ready replica.
+	setTemplateLocalityCache(snapshotID, []ReplicaStatus{replica})
+	registerTemplateReplicaForSnapshot(snapshotID, nodeID, 1)
+	templateDefinitionCache.Delete(snapshotID)
+	if cacheErr := setTemplateRequestCache(snapshotID, storedReq); cacheErr != nil {
+		logger.Warnf("set snapshot request cache failed: %v", cacheErr)
+	}
+	if snapUpdates["remote_status"] == constants.RemoteStatusInProgress {
+		remotestatus.WatchSnapshot(ctx, snapshotID, nodeIP, commitBackend, exportUUIDs, mode)
 	}
 	success = true
 	publishCheckpoint(ctx)
 	logger.Infof("snapshot create finished successfully")
 	return nil
+}
+
+// completeSnapshotCreate is the single durable completion boundary. A crash
+// before it leaves RUNNING/CREATING for the existing reconciler; a crash after
+// it leaves the replica, snapshot and job consistently READY.
+func completeSnapshotCreate(ctx context.Context, snapshotID, instanceType string, replica ReplicaStatus, snapshotUpdates map[string]any, jobID string, jobUpdates map[string]any) error {
+	return store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := upsertReplicaTx(tx, snapshotID, instanceType, replica); err != nil {
+			return err
+		}
+		if err := updateSnapshotFieldsTx(tx, snapshotID, snapshotUpdates); err != nil {
+			return err
+		}
+		return updateTemplateImageJobTx(tx, jobID, jobUpdates)
+	})
 }
 
 func RollbackSandboxToSnapshot(ctx context.Context, requestID, sandboxID, snapshotID, instanceType, backend string) (*sandboxtypes.TemplateImageJobInfo, error) {

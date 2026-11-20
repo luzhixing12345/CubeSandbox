@@ -519,6 +519,12 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		Kind:              storage.CatalogKindRuntimeSnapshot,
 		Backend:           backend,
 	}); err != nil {
+		if backend == cow.BackendHybrid {
+			cleanupArtifacts()
+			rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+			rsp.Ret.RetMsg = fmt.Sprintf("failed to persist hybrid snapshot catalog: %v", err)
+			return rsp, nil
+		}
 		// Catalog write failures do not invalidate the snapshot: master will
 		// still receive the physical references in the response and rollback
 		// path keeps the legacy fallback. Log loudly so operators notice
@@ -931,6 +937,13 @@ func (s *service) cleanupTemplate(ctx context.Context, req *cubebox.CleanupTempl
 			rsp.TemplateID)
 		return rsp, nil
 	}
+	if backend == cow.BackendHybrid {
+		if err := storage.WaitHybridSnapshotPublish(ctx, rsp.TemplateID); err != nil {
+			rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+			rsp.Ret.RetMsg = err.Error()
+			return rsp, nil
+		}
+	}
 	refs, snapshotPath, err := resolveCleanupRefs(ctx, backend, rsp.TemplateID, req.GetObjects(), req.GetSnapshotPath())
 	if err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
@@ -963,6 +976,13 @@ func (s *service) cleanupTemplate(ctx context.Context, req *cubebox.CleanupTempl
 		}
 		rsp.Ret.RetCode = rerr.Code()
 		rsp.Ret.RetMsg = rerr.Message()
+	}
+	if backend == cow.BackendHybrid {
+		if err := storage.RemoveHybridSnapshotMetadata(rsp.TemplateID); err != nil {
+			rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+			rsp.Ret.RetMsg = err.Error()
+			return rsp, nil
+		}
 	}
 	storage.DeleteSnapshotCatalogFor(backend, rsp.TemplateID)
 	return rsp, nil

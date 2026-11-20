@@ -41,15 +41,17 @@ import (
 // a kernel mismatch requires rebuilding the snapshot/template replica, but does
 // not by itself require rebuilding the rootfs ext4 artifact.
 type SnapshotCatalogEntry struct {
-	SnapshotID   string `json:"snapshot_id"`
-	InstanceType string `json:"instance_type,omitempty"`
-	SpecDir      string `json:"spec_dir,omitempty"`
-	SnapshotPath string `json:"snapshot_path"`
-	MetaDir      string `json:"meta_dir"`
-	RootfsVol    string `json:"rootfs_vol"`
-	RootfsKind   string `json:"rootfs_kind"`
-	MemoryVol    string `json:"memory_vol"`
-	MemoryKind   string `json:"memory_kind"`
+	// Version 1 packages capture metadata locally and require atomic remote publication.
+	HybridMetadataVersion int    `json:"hybrid_metadata_version,omitempty"`
+	SnapshotID            string `json:"snapshot_id"`
+	InstanceType          string `json:"instance_type,omitempty"`
+	SpecDir               string `json:"spec_dir,omitempty"`
+	SnapshotPath          string `json:"snapshot_path"`
+	MetaDir               string `json:"meta_dir"`
+	RootfsVol             string `json:"rootfs_vol"`
+	RootfsKind            string `json:"rootfs_kind"`
+	MemoryVol             string `json:"memory_vol"`
+	MemoryKind            string `json:"memory_kind"`
 	// MetadataVol/Kind is the S3 package metadata volume (cloned from the
 	// node-local base snapshot or a parent package metadata volume).
 	// Empty on XFS (plain directory). The node-local base volume/snapshot
@@ -123,9 +125,9 @@ var (
 	// namespaces. Backend is chosen by the request (or which root was
 	// registered), never by a field inside catalog.json.
 	snapshotCatalogs = map[string]*snapshotCatalogNS{
-		cow.BackendXFS: {index: map[string]*SnapshotCatalogEntry{}},
-		cow.BackendS3:  {index: map[string]*SnapshotCatalogEntry{}},
-		cow.BackendJFS: {index: map[string]*SnapshotCatalogEntry{}},
+		cow.BackendXFS:    {index: map[string]*SnapshotCatalogEntry{}},
+		cow.BackendS3:     {index: map[string]*SnapshotCatalogEntry{}},
+		cow.BackendJFS:    {index: map[string]*SnapshotCatalogEntry{}},
 		cow.BackendHybrid: {index: map[string]*SnapshotCatalogEntry{}},
 	}
 )
@@ -239,6 +241,9 @@ func WriteSnapshotCatalogFor(backend string, entry *SnapshotCatalogEntry) error 
 	if entry.MetaDir == "" {
 		entry.MetaDir = filepath.Join(entry.SnapshotPath, SnapshotMetadataDir)
 	}
+	if isHybridBackend(backend) && pathWithin(HybridLocalStorageRoot(), entry.SnapshotPath) {
+		entry.HybridMetadataVersion = 1
+	}
 	catalogDir := entry.MetaDir
 	if entry.CreatedAt == "" {
 		entry.CreatedAt = time.Now().UTC().Format(time.RFC3339)
@@ -260,10 +265,21 @@ func WriteSnapshotCatalogFor(backend string, entry *SnapshotCatalogEntry) error 
 	if err := os.WriteFile(tmp, body, 0o644); err != nil {
 		return err
 	}
+	if entry.HybridMetadataVersion > 0 {
+		if err := syncHybridPath(tmp); err != nil {
+			return err
+		}
+	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
+	if entry.HybridMetadataVersion > 0 {
+		if err := syncHybridMetadataTree(entry.SnapshotPath); err != nil {
+			return err
+		}
+	}
+
 	snapshotCatalogMu.Lock()
 	catalogNSLocked(backend).index[entry.SnapshotID] = cloneCatalogEntry(entry)
 	snapshotCatalogMu.Unlock()
@@ -315,7 +331,7 @@ func GetLocalSnapshotFor(ctx context.Context, backend, snapshotID string) (*Snap
 	key := catalogBackendKey(backend)
 	snapshotCatalogMu.RLock()
 	if ns := snapshotCatalogs[key]; ns != nil && ns.index != nil {
-		if cached, ok := ns.index[snapshotID]; ok {
+		if cached, ok := ns.index[snapshotID]; ok && (!isHybridBackend(key) || hybridCatalogPresent(cached)) {
 			out := cloneCatalogEntry(cached)
 			snapshotCatalogMu.RUnlock()
 			return out, nil
@@ -428,6 +444,9 @@ func findSnapshotCatalogOnDisk(backend, snapshotID string) (*SnapshotCatalogEntr
 			}
 			for _, m := range matches {
 				entry, err := readSnapshotCatalogFile(m)
+				if err == nil && isHybridBackend(backend) {
+					err = rebaseHybridCatalog(entry, m)
+				}
 				if err != nil {
 					continue
 				}
@@ -449,6 +468,9 @@ func scanSnapshotCatalogsUnderRoot(backend, root string) ([]*SnapshotCatalogEntr
 		}
 		for _, m := range matches {
 			entry, err := readSnapshotCatalogFile(m)
+			if err == nil && isHybridBackend(backend) {
+				err = rebaseHybridCatalog(entry, m)
+			}
 			if err != nil {
 				continue
 			}
@@ -501,11 +523,16 @@ func ReadSnapshotCatalogAt(snapshotPath string) (*SnapshotCatalogEntry, error) {
 		return nil, ErrSnapshotCatalogNotFound
 	}
 	clean := filepath.Clean(snapshotPath)
-	entry, err := readSnapshotCatalogFile(filepath.Join(clean, snapshotCatalogFileName))
-	if err == nil {
-		return entry, nil
+	path := filepath.Join(clean, snapshotCatalogFileName)
+	entry, err := readSnapshotCatalogFile(path)
+	if err != nil {
+		path = filepath.Join(clean, S3SnapshotMetadataDir, snapshotCatalogFileName)
+		entry, err = readSnapshotCatalogFile(path)
 	}
-	return readSnapshotCatalogFile(filepath.Join(clean, S3SnapshotMetadataDir, snapshotCatalogFileName))
+	if err == nil && isHybridBackend(entry.Backend) {
+		err = rebaseHybridCatalog(entry, path)
+	}
+	return entry, err
 }
 
 func cloneCatalogEntry(in *SnapshotCatalogEntry) *SnapshotCatalogEntry {

@@ -29,6 +29,7 @@ func TestSnapshotArtifactLifecyclePostgreSQL(t *testing.T) {
 	env := newPGDockerEnv(t)
 	defer env.teardown()
 	db := openMigratedPostgresGORM(t, env)
+	testSnapshotArtifactConcurrentReaders(t, db)
 	oldDB := store.db
 	store.db = db
 	t.Cleanup(func() { store.db = oldDB })
@@ -42,6 +43,7 @@ func TestSnapshotArtifactLifecycleMySQL(t *testing.T) {
 	env := newMySQLDockerEnv(t)
 	defer env.teardown()
 	db := openMigratedMySQLGORM(t, env)
+	testSnapshotArtifactConcurrentReaders(t, db)
 	oldDB := store.db
 	store.db = db
 	t.Cleanup(func() { store.db = oldDB })

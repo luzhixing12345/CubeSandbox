@@ -447,3 +447,43 @@ func TestEnsureCubeRunTemplateRecoveryIsolatesBackends(t *testing.T) {
 		})
 	}
 }
+
+func TestHybridRecoveryPrefersLocalAndFallsBackAfterEviction(t *testing.T) {
+	manager := newReadyTemplateManager(t)
+	root := t.TempDir()
+	localRoot, sharedRoot := filepath.Join(root, "local"), filepath.Join(root, "shared")
+	storage.SetSnapshotCatalogRootsFor("hybrid", localRoot, sharedRoot)
+	t.Cleanup(func() { storage.SetSnapshotCatalogRootsFor("hybrid") })
+	id := "snap-recovery-local"
+	for _, r := range []string{localRoot, sharedRoot} {
+		home := filepath.Join(r, id)
+		path := metadataHomeConfigPath(home)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(`{}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := storage.WriteSnapshotCatalogFor("hybrid", &storage.SnapshotCatalogEntry{SnapshotID: id, SnapshotPath: home, Backend: "hybrid"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	storage.DeleteSnapshotCatalogFor("hybrid", id)
+	got, err := manager.EnsureCubeRunTemplate(context.Background(), id, "hybrid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Snapshot.Snapshot.Path != filepath.Join(localRoot, id, "metadata") {
+		t.Fatal(got.Snapshot.Snapshot.Path)
+	}
+	if err := os.RemoveAll(filepath.Join(localRoot, id)); err != nil {
+		t.Fatal(err)
+	}
+	got, err = manager.EnsureCubeRunTemplate(context.Background(), id, "hybrid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Snapshot.Snapshot.Path != filepath.Join(sharedRoot, id, "metadata") {
+		t.Fatal(got.Snapshot.Snapshot.Path)
+	}
+}
